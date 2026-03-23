@@ -8,7 +8,9 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''/c/Users/iyerm/Documents/GitHub/ISpyPill/app.py''\\).read\\(\\)\\); print\\(''app.py OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''/c/Users/iyerm/Documents/GitHub/ISpyPill/pill_counter.py''\\).read\\(\\)\\); print\\(''pill_counter.py OK''\\)\")",
       "Bash(pip install:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(grep -v \"^$\")",
+      "Bash(python -c \":*)"
     ]
   }
 }
