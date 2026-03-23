@@ -10,7 +10,13 @@
       "Bash(pip install:*)",
       "Bash(python:*)",
       "Bash(grep -v \"^$\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(npm --version)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Read(//tmp/**)",
+      "Bash(curl -s http://localhost:5000/)",
+      "Bash(curl -s http://localhost:5173/)"
     ]
   }
 }
