@@ -16,6 +16,22 @@ DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", 
 app = Flask(__name__, static_folder=DIST_DIR, static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
+
+# ── CORS (needed for Expo web; harmless for native) ────────────────────────────
+
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+@app.route("/ping")
+def ping():
+    """Quick reachability check used by the mobile app on startup."""
+    return jsonify({"status": "ok"})
+
 # Longest side of any uploaded image is capped at this for speed
 MAX_IMAGE_DIM = 2000
 
@@ -70,11 +86,11 @@ def analyze():
         ref_image   = load_image_from_file(ref_file)
         group_image = load_image_from_file(group_file)
 
-        ref_area, color_profiles, is_white, ref_shape = analyze_reference(ref_image)
+        ref_area, color_profiles, is_white, ref_shape, bg_model = analyze_reference(ref_image)
 
         count, annotated_image = count_pills(
             group_image, ref_area, color_profiles,
-            is_white=is_white, ref_shape=ref_shape,
+            is_white=is_white, ref_shape=ref_shape, bg_model=bg_model,
         )
 
         return jsonify({

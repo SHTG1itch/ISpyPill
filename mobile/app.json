@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "ISpyPill",
+    "slug": "ispypill",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.ispypill.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "ISpyPill needs camera access to take photos of pills.",
+        "NSPhotoLibraryUsageDescription": "ISpyPill needs photo library access to select pill images."
+      }
+    },
+    "android": {
+      "package": "com.ispypill.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#2563eb"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "ISpyPill needs photo library access to select pill images.",
+          "cameraPermission": "ISpyPill needs camera access to take photos of pills."
+        }
+      ],
+      "expo-asset"
+    ]
+  }
+}
