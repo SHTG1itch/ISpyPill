@@ -765,281 +765,100 @@ def _annotate(annotated: np.ndarray,
 
 def analyze_reference(image_np):
     """
-    Analyse a single reference-pill image.
+    Analyse a single reference-pill image using GrabCut for robust isolation.
 
     Returns
     -------
-    ref_area         : float  — pixel area of one pill
-    color_profiles   : list   — one dict per dominant colour cluster
-    is_white         : bool   — True when pill is achromatic AND lighter than bg
-    ref_shape        : dict   — circularity, aspect_ratio, solidity
-    background_model : dict   — LAB statistics of the background and pill regions,
-                                used for reference-calibrated segmentation in count_pills()
+    ref_area     : float      — pixel area of one pill
+    pill_hist    : np.ndarray — 32×32 Hue-Saturation histogram of pill pixels
+    bg_hist      : np.ndarray — 32×32 Hue-Saturation histogram of background pixels
+    is_achromatic: bool       — True when >80% of pill pixels have saturation < 30
+    ref_shape    : dict       — circularity, aspect_ratio, solidity
     """
     if image_np is None or image_np.size == 0:
         raise ValueError("Reference image is empty or invalid.")
 
     image_np = _normalise_channels(image_np)
-    enhanced = _enhance(image_np)
-    h, w     = enhanced.shape[:2]
+    h, w = image_np.shape[:2]
     img_area = h * w
 
-    gray    = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    # ── GrabCut: initialise with central 60% rectangle ─────────────────────
+    mx, my = int(w * 0.20), int(h * 0.20)
+    rect = (mx, my, w - 2 * mx, h - 2 * my)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    gc_mask = np.zeros((h, w), np.uint8)
 
-    # ── Find reference pill contour ─────────────────────────────────────────
-    # Grayscale thresholding detects pills that differ from the background in
-    # brightness (e.g. white pill on a dark tray).  For pills that have the same
-    # grayscale as the background but differ in colour (e.g. orange on gray),
-    # we also threshold on the LAB A/B chroma channels and HSV saturation from
-    # the ORIGINAL (pre-CLAHE) image, which preserves colour differences.
-    MIN_FRAC, MAX_FRAC = 0.01, 0.88
+    try:
+        cv2.grabCut(image_np, gc_mask, rect, bgd_model, fgd_model, 5,
+                    cv2.GC_INIT_WITH_RECT)
+        gc_binary = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+        ).astype(np.uint8)
+    except Exception:
+        gc_binary = np.zeros((h, w), np.uint8)
 
-    lab_orig = cv2.cvtColor(image_np, cv2.COLOR_BGR2LAB)
-    hsv_orig = cv2.cvtColor(image_np, cv2.COLOR_BGR2HSV)
+    # ── Select contour nearest image centre from GrabCut result ────────────
+    center = np.array([w / 2.0, h / 2.0])
+    ref_contour = None
+    best_dist = float("inf")
 
-    # LAB A and B channel deviations from neutral highlight chromatic pills
-    a_dev = np.clip(np.abs(lab_orig[:, :, 1].astype(np.int16) - 128), 0, 255).astype(np.uint8)
-    b_dev = np.clip(np.abs(lab_orig[:, :, 2].astype(np.int16) - 128), 0, 255).astype(np.uint8)
+    cnts, _ = cv2.findContours(gc_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if not (0.02 * img_area <= area <= 0.85 * img_area):
+            continue
+        hull_a = cv2.contourArea(cv2.convexHull(c)) + 1e-6
+        if area / hull_a < 0.3:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        d = float(np.hypot(cx - center[0], cy - center[1]))
+        if d < best_dist:
+            best_dist, ref_contour = d, c
 
-    def _otsu_and_adaptive(src_gray):
-        """4 binary masks from a single-channel source."""
-        bl  = cv2.GaussianBlur(src_gray, (7, 7), 0)
-        out = []
-        for flags in [cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                      cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU]:
-            _, t = cv2.threshold(bl, 0, 255, flags)
-            out.append(t)
-        for mode in [cv2.THRESH_BINARY, cv2.THRESH_BINARY_INV]:
-            out.append(cv2.adaptiveThreshold(bl, 255,
-                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C, mode, 21, 2))
-        return out
-
-    source_masks = (
-        _otsu_and_adaptive(blurred)            # grayscale (enhanced image)
-        + _otsu_and_adaptive(a_dev)            # LAB A deviation (orange/red/green pills)
-        + _otsu_and_adaptive(b_dev)            # LAB B deviation (yellow/blue pills)
-        + _otsu_and_adaptive(hsv_orig[:, :, 1])  # HSV saturation (any saturated pill)
-    )
-
-    # Collect size-filtered contour candidates; deduplicate by bounding rect
-    candidates  = []
-    seen_keys   = set()
-    kernel      = np.ones((5, 5), np.uint8)
-    for raw in source_masks:
-        cleaned = cv2.morphologyEx(raw,     cv2.MORPH_CLOSE, kernel, iterations=2)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,  kernel, iterations=1)
-        cnts, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            frac = cv2.contourArea(c) / img_area
-            if not (MIN_FRAC <= frac <= MAX_FRAC):
-                continue
-            bx, by, bw_c, bh_c = cv2.boundingRect(c)
-            key = (bx // 15, by // 15, bw_c // 15, bh_c // 15)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            hull_a   = cv2.contourArea(cv2.convexHull(c)) + 1e-6
-            solidity = cv2.contourArea(c) / hull_a
-            candidates.append((c, solidity))
-
-    if not candidates:
-        raise ValueError(
-            "Could not isolate the reference pill. "
-            "Use a photo with the pill clearly visible against a contrasting background."
-        )
-
-    # ── Reference pill selection ─────────────────────────────────────────────
-    # Primary strategy: highest solidity — works reliably when the pill is
-    # detectable in grayscale (bright white pill on dark/coloured tray, etc.).
-    #
-    # Fallback: if the best-solidity candidate has very low LOCAL colour contrast
-    # against its immediate neighbourhood, it is almost certainly a grayscale
-    # artefact (shadow, background patch) rather than the pill.  In that case we
-    # re-rank by  solidity × local_contrast  so that a chromatic pill that is
-    # invisible in grayscale (e.g. salmon/orange on a gray tray) can still win.
-    #
-    # Local contrast is measured in LAB space against a ~10 px ring of pixels
-    # just outside the contour.  Channel weights: L × 0.5, A/B × 2.0  (colour
-    # is a more stable pill identifier than brightness under variable lighting).
-    pre_lab = lab_orig
-    ring_k  = np.ones((21, 21), np.uint8)   # gives a ~10-px ring
-
-    def _local_contrast(contour) -> float:
-        pmask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(pmask, [contour], -1, 255, -1)
-        ring  = cv2.subtract(cv2.dilate(pmask, ring_k), pmask)
-        ppx   = pre_lab[pmask > 0].astype(np.float32)
-        rpx   = pre_lab[ring  > 0].astype(np.float32)
-        if len(ppx) == 0 or len(rpx) == 0:
-            return 0.0
-        diff  = np.abs(np.mean(ppx, axis=0) - np.mean(rpx, axis=0))
-        return float(diff[0] * 0.5 + diff[1] * 2.0 + diff[2] * 2.0)
-
-    # Primary: max solidity
-    ref_contour = max(candidates, key=lambda x: x[1])[0]
-
-    # Fallback: if primary candidate has near-zero local colour contrast, the
-    # pill must be distinguished by chromaticity → re-rank by contrast × solidity.
-    if _local_contrast(ref_contour) < 12.0:
-        scored      = [(c, _local_contrast(c) * sol) for c, sol in candidates]
-        ref_contour = max(scored, key=lambda x: x[1])[0]
+    # ── Fallback if GrabCut found nothing valid ─────────────────────────────
+    if ref_contour is None:
+        ref_contour = _fallback_ref_contour(image_np)
 
     ref_area = float(cv2.contourArea(ref_contour))
-
     if ref_area < 80:
         raise ValueError("Reference pill appears too small. Please use a closer photo.")
 
-    # ── Shape features ──────────────────────────────────────────────────────
     ref_shape = _shape_metrics(ref_contour)
 
-    # Refine ref_shape using a tighter, unblurred contour derived from the
-    # raw AB-deviation inside the selected pill region.
-    # The primary contour may come from a Gaussian-blurred source (the
-    # _otsu_and_adaptive call uses GaussianBlur), which rounds corners and
-    # inflates circularity.  For pills with genuine low circularity (e.g.
-    # oblong or irregular tablets) this makes the shape tolerance too strict
-    # and causes valid group-image blobs to be rejected.
-    # The AB-deviation channels are inherently crisp (no blur applied to
-    # a_dev/b_dev themselves), giving a more representative boundary.
-    pill_mask_tight = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(pill_mask_tight, [ref_contour], -1, 255, -1)
-    ab_combined   = np.maximum(a_dev, b_dev)
-    inner_ab      = ab_combined[pill_mask_tight > 0]
-    if len(inner_ab) > 0 and int(np.max(inner_ab)) > 10:
-        tight_thresh = max(int(np.max(inner_ab) * 0.50), 8)
-        tight_binary = np.uint8(
-            ((ab_combined >= tight_thresh) & (pill_mask_tight > 0))
-        ) * 255
-        tight_cnts, _ = cv2.findContours(
-            tight_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if tight_cnts:
-            best_tight = max(tight_cnts, key=cv2.contourArea)
-            if cv2.contourArea(best_tight) >= ref_area * 0.20:
-                ref_shape = _shape_metrics(best_tight)
-
-    # ── Colour extraction ───────────────────────────────────────────────────
-    pill_mask = np.zeros((h, w), dtype=np.uint8)
+    # ── Build pill and background masks ─────────────────────────────────────
+    pill_mask = np.zeros((h, w), np.uint8)
     cv2.drawContours(pill_mask, [ref_contour], -1, 255, -1)
+    bg_mask = cv2.bitwise_not(pill_mask)
 
-    # Use HSV from the ORIGINAL image for colour classification.
-    # CLAHE in the enhanced image can compress saturation, causing a pale-orange
-    # pill to register as achromatic (mean_sat < 40) and be misclassified.
-    hsv_img  = cv2.cvtColor(image_np, cv2.COLOR_BGR2HSV)
-    pill_hsv = hsv_img[pill_mask == 255].astype(np.float32)
+    erode_k = np.ones((5, 5), np.uint8)
+    pill_inner = cv2.erode(pill_mask, erode_k, iterations=2)
+    bg_inner   = cv2.erode(bg_mask,   erode_k, iterations=3)
 
-    if len(pill_hsv) == 0:
-        raise ValueError("Could not extract colour from the reference pill region.")
+    # Use original image HSV — CLAHE compresses saturation and confuses colour
+    hsv_img = cv2.cvtColor(image_np, cv2.COLOR_BGR2HSV)
 
-    mean_sat = float(np.mean(pill_hsv[:, 1]))
-    is_fully_achromatic = mean_sat < 40
+    pm = pill_inner if cv2.countNonZero(pill_inner) > 20 else pill_mask
+    bm = bg_inner   if cv2.countNonZero(bg_inner)   > 20 else bg_mask
 
-    # ── K-Means colour clustering ────────────────────────────────────────────
-    if is_fully_achromatic or len(pill_hsv) < 20:
-        k_best    = 1
-        labels    = np.zeros(len(pill_hsv), dtype=np.int32)
-        centers   = np.mean(pill_hsv, axis=0, keepdims=True)
+    # ── 2D Hue-Saturation histograms (32 × 32 bins) ─────────────────────────
+    pill_hist = cv2.calcHist([hsv_img], [0, 1], pm, [32, 32], [0, 180, 0, 256])
+    bg_hist   = cv2.calcHist([hsv_img], [0, 1], bm, [32, 32], [0, 180, 0, 256])
+    cv2.normalize(pill_hist, pill_hist, 0, 255, cv2.NORM_MINMAX)
+    cv2.normalize(bg_hist,   bg_hist,   0, 255, cv2.NORM_MINMAX)
+
+    # ── Achromatic detection ─────────────────────────────────────────────────
+    pill_hsv_px = hsv_img[pill_mask == 255]
+    if len(pill_hsv_px) > 0:
+        is_achromatic = bool(np.mean(pill_hsv_px[:, 1] < 30) > 0.80)
     else:
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 12, 1.0)
-        comp2, lab2, cen2 = cv2.kmeans(pill_hsv, 2, None, criteria, 12, cv2.KMEANS_PP_CENTERS)
-        comp3, lab3, cen3 = cv2.kmeans(pill_hsv, 3, None, criteria, 12, cv2.KMEANS_PP_CENTERS)
-        if comp2 > 0 and (comp3 / comp2) < 0.58:
-            k_best, labels, centers = 3, lab3.ravel(), cen3
-        else:
-            k_best, labels, centers = 2, lab2.ravel(), cen2
+        is_achromatic = True
 
-    # ── Build colour profiles ────────────────────────────────────────────────
-    color_profiles = []
-    total_px       = len(pill_hsv)
-
-    for k in range(k_best):
-        mask_k  = labels == k
-        cluster = pill_hsv[mask_k]
-        if len(cluster) == 0:
-            continue
-        weight = len(cluster) / total_px
-        if weight < 0.05 and k_best > 1:
-            continue
-
-        center  = centers[k] if k_best > 1 else centers[0]
-        std_hsv = np.std(cluster, axis=0)
-
-        h_tol = max(16.0, 2.2 * std_hsv[0])
-        s_tol = max(55.0, 2.2 * std_hsv[1])
-        v_tol = max(55.0, 2.2 * std_hsv[2])
-
-        lo = np.array([max(0.0,   center[0] - h_tol),
-                       max(0.0,   center[1] - s_tol),
-                       max(0.0,   center[2] - v_tol)], dtype=np.float32)
-        hi = np.array([min(179.0, center[0] + h_tol),
-                       min(255.0, center[1] + s_tol),
-                       min(255.0, center[2] + v_tol)], dtype=np.float32)
-
-        color_profiles.append({
-            "hsv_lower":     lo,
-            "hsv_upper":     hi,
-            "is_achromatic": bool(center[1] < 40),
-            "wraps_hue":     bool(center[0] < 10 or center[0] > 165),
-            "weight":        float(weight),
-            "mean_value":    float(center[2]),
-        })
-
-    if not color_profiles:
-        mv = float(np.mean(pill_hsv[:, 2]))
-        color_profiles = [{
-            "hsv_lower":     np.array([0, 0, max(0.0, mv - 65)], dtype=np.float32),
-            "hsv_upper":     np.array([179, 255, min(255.0, mv + 65)], dtype=np.float32),
-            "is_achromatic": True,
-            "wraps_hue":     False,
-            "weight":        1.0,
-            "mean_value":    mv,
-        }]
-
-    is_white = all(p["is_achromatic"] for p in color_profiles)
-
-    # ── Background model ────────────────────────────────────────────────────
-    # Build LAB statistics for the background (non-pill) and pill regions.
-    # IMPORTANT: use the ORIGINAL (pre-CLAHE) image here — CLAHE equalises
-    # local contrast which can collapse the pill→background difference and
-    # make an orange pill look as bright as its gray background.
-    lab_original = cv2.cvtColor(image_np, cv2.COLOR_BGR2LAB)
-
-    erode_k   = np.ones((7, 7), np.uint8)
-    # Erode pill mask inward to get clean interior pill pixels (skip edges)
-    pill_core = cv2.erode(pill_mask, erode_k, iterations=2)
-    # Erode background mask away from the pill to avoid transition pixels
-    bg_mask_clean = cv2.erode(cv2.bitwise_not(pill_mask), erode_k, iterations=4)
-
-    pill_lab_px = lab_original[pill_core > 0].astype(np.float32)
-    bg_lab_px   = lab_original[bg_mask_clean > 0].astype(np.float32)
-
-    # Fall back to full-mask pixels if erosion was too aggressive
-    if len(pill_lab_px) < 20 or len(bg_lab_px) < 20:
-        pill_lab_px = lab_original[pill_mask > 0].astype(np.float32)
-        bg_lab_px   = lab_original[cv2.bitwise_not(pill_mask) > 0].astype(np.float32)
-
-    bg_mean_lab   = np.mean(bg_lab_px,   axis=0)
-    bg_std_lab    = np.std(bg_lab_px,    axis=0)
-    pill_mean_lab = np.mean(pill_lab_px, axis=0)
-
-    background_model = {
-        "bg_mean_lab":   bg_mean_lab,
-        "bg_std_lab":    bg_std_lab,
-        "pill_mean_lab": pill_mean_lab,
-    }
-
-    # Refine is_white using the background model from the original image.
-    # HSV saturation alone misclassifies pale-orange/salmon pills as "white"
-    # when they are actually darker than the background.
-    # A truly white pill is achromatic AND not significantly darker than the bg.
-    if is_white:
-        delta_L = float(pill_mean_lab[0]) - float(bg_mean_lab[0])
-        if delta_L < -8:
-            # Pill is noticeably darker than the background → not a "white" pill
-            is_white = False
-
-    return float(ref_area), color_profiles, is_white, ref_shape, background_model
+    return float(ref_area), pill_hist, bg_hist, is_achromatic, ref_shape
 
 
 def count_pills(group_image_np, ref_area, color_profiles,
