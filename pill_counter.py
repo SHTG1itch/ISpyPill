@@ -70,6 +70,52 @@ def _achromatic_mask(bgr: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Histogram backprojection mask
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_probability_mask(group_bgr: np.ndarray,
+                             pill_hist: np.ndarray,
+                             bg_hist: np.ndarray,
+                             ref_radius: float,
+                             is_achromatic: bool) -> np.ndarray:
+    """
+    Return a binary mask of pill pixels in group_bgr.
+
+    Chromatic path  — histogram backprojection on the ratio histogram.
+    Achromatic path — CLAHE + LAB L-channel Otsu (brightness-based).
+    """
+    if is_achromatic:
+        return _achromatic_mask(group_bgr)
+
+    # Ratio histogram: bins where pills dominate background get high values
+    ratio_hist = (pill_hist + 1e-6) / (bg_hist + 1e-6)
+    cv2.normalize(ratio_hist, ratio_hist, 0, 255, cv2.NORM_MINMAX)
+    ratio_hist = ratio_hist.astype(np.float32)
+
+    # Backproject: each pixel's (H, S) maps to its "pill likelihood"
+    hsv_group = cv2.cvtColor(group_bgr, cv2.COLOR_BGR2HSV)
+    prob_map = cv2.calcBackProject(
+        [hsv_group], [0, 1], ratio_hist, [0, 180, 0, 256], 1
+    )
+
+    # Smooth to connect adjacent pill pixels and suppress isolated noise
+    sigma = max(3.0, ref_radius * 0.10)
+    ksize = int(sigma * 3) * 2 + 1
+    prob_map = cv2.GaussianBlur(prob_map, (ksize, ksize), sigma)
+
+    # Otsu threshold on probability map
+    _, mask = cv2.threshold(prob_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Degenerate check: fall back to achromatic mask if coverage is extreme
+    h, w = mask.shape
+    fill = float(np.sum(mask > 0)) / (h * w)
+    if fill < 0.01 or fill > 0.90:
+        return _achromatic_mask(group_bgr)
+
+    return mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Fallback reference contour selector
 # ─────────────────────────────────────────────────────────────────────────────
 

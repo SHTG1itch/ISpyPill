@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
 import pytest
-from pill_counter import _fallback_ref_contour, analyze_reference, _achromatic_mask
+from pill_counter import (_fallback_ref_contour, analyze_reference, _achromatic_mask,
+                          _build_probability_mask)
 
 
 def make_pill_on_bg(bg_color=(80, 80, 80), pill_color=(230, 230, 230), size=300):
@@ -71,3 +72,44 @@ def test_achromatic_mask_detects_white_region():
     left_fill  = np.sum(mask[:, :100]  > 0)
     right_fill = np.sum(mask[:, 100:] > 0)
     assert right_fill > left_fill * 2
+
+
+# ── Task 4: _build_probability_mask ──────────────────────────────────────────
+
+def make_group_image(bg_color=(80, 80, 80), pill_color=(30, 150, 200), size=400, n=5):
+    """Multiple circles of pill_color on bg_color background."""
+    img = np.full((size, size, 3), bg_color, dtype=np.uint8)
+    radius = size // 10
+    for i in range(n):
+        cx = (size // (n + 1)) * (i + 1)
+        cy = size // 2
+        cv2.circle(img, (cx, cy), radius, pill_color, -1)
+    return img, radius
+
+
+def test_backprojection_highlights_pill_colored_regions():
+    pill_color = (30, 150, 200)
+    bg_color   = (80, 80, 80)
+    ref_img = make_pill_on_bg(bg_color=bg_color, pill_color=pill_color, size=200)
+    group_img, r = make_group_image(bg_color=bg_color, pill_color=pill_color)
+
+    _, pill_hist, bg_hist, is_achromatic, _ = analyze_reference(ref_img)
+    ref_radius = 200 // 5
+
+    mask = _build_probability_mask(group_img, pill_hist, bg_hist, ref_radius, is_achromatic=False)
+
+    h, w = mask.shape
+    fill = np.sum(mask > 0) / (h * w)
+    assert 0.05 < fill < 0.90, f"fill={fill:.2f} is out of expected range"
+
+
+def test_backprojection_uses_achromatic_fallback():
+    ref_img = make_pill_on_bg(bg_color=(30, 30, 30), pill_color=(240, 240, 240))
+    group_img, _ = make_group_image(bg_color=(30, 30, 30), pill_color=(240, 240, 240))
+    _, pill_hist, bg_hist, is_achromatic, _ = analyze_reference(ref_img)
+
+    assert is_achromatic is True
+    mask = _build_probability_mask(group_img, pill_hist, bg_hist, 40, is_achromatic=True)
+    h, w = mask.shape
+    fill = np.sum(mask > 0) / (h * w)
+    assert 0.01 < fill < 0.99
