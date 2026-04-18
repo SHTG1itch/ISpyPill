@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 import pytest
 from pill_counter import (_fallback_ref_contour, analyze_reference, _achromatic_mask,
-                          _build_probability_mask, _estimate_scale, _reconcile_counts)
+                          _build_probability_mask, _estimate_scale, _reconcile_counts,
+                          _watershed_count)
 
 
 def make_pill_on_bg(bg_color=(80, 80, 80), pill_color=(230, 230, 230), size=300):
@@ -153,3 +154,29 @@ def test_reconcile_counts_maxima_sanity_check():
 
 def test_reconcile_counts_area_wins_otherwise():
     assert _reconcile_counts(4, 1, 4000, 1000) == 4
+
+
+# ── Task 6: _watershed_count ──────────────────────────────────────────────────
+
+def make_touching_pills(pill_area=3000, n=3, size=300):
+    mask = np.zeros((size, size), dtype=np.uint8)
+    annotated = np.full((size, size, 3), 200, dtype=np.uint8)
+    radius = int(np.sqrt(pill_area / np.pi))
+    spacing = radius * 2 - radius // 3
+    start_x = size // 2 - spacing * (n - 1) // 2
+    for i in range(n):
+        cx = start_x + i * spacing
+        cy = size // 2
+        cv2.circle(mask,      (cx, cy), radius, 255, -1)
+        cv2.circle(annotated, (cx, cy), radius, (180, 180, 180), -1)
+    return mask, annotated
+
+
+def test_watershed_counts_touching_pills():
+    n = 3
+    ref_area = 3000.0
+    ref_radius = float(np.sqrt(ref_area / np.pi))
+    mask, annotated = make_touching_pills(pill_area=int(ref_area), n=n)
+
+    total, _, _, regions = _watershed_count(mask, annotated, ref_area, ref_radius, ref_shape=None)
+    assert abs(total - n) <= 1, f"Expected ~{n} pills, got {total}"

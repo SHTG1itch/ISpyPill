@@ -597,78 +597,70 @@ def _watershed_count(mask: np.ndarray,
                      annotated: np.ndarray,
                      ref_area: float,
                      ref_radius: float,
-                     ref_shape: dict | None) -> tuple[int, np.ndarray, np.ndarray]:
+                     ref_shape: dict | None) -> tuple[int, np.ndarray, np.ndarray, list]:
     """
-    Run watershed on *mask* and count pills in each region.
-    Returns (total_count, annotated_image, dist_transform_normalised).
+    Run watershed on mask and count pills in each region.
+    Foreground threshold is computed per connected component (0.35 × local max)
+    to avoid over- or under-splitting when small and large blobs coexist.
+    Returns (total_count, annotated_image, dist_transform_normalised, pill_regions).
     """
     h, w = mask.shape
 
-    # ── Distance transform ──────────────────────────────────────────────────
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     dist_norm = dist.copy()
     cv2.normalize(dist, dist_norm, 0, 1.0, cv2.NORM_MINMAX)
 
-    # Adaptive foreground threshold:
-    # Larger pills relative to image size → higher threshold (less risk of
-    # splitting a single pill into two segments).
-    pill_fraction = ref_radius / (0.5 * (h + w) + 1e-6)
-    fg_thresh = float(np.clip(0.28 + pill_fraction * 1.5, 0.22, 0.52))
+    # Per-component foreground: 0.35 × each component's local maximum
+    sure_fg = np.zeros((h, w), dtype=np.uint8)
+    num_labels, comp_labels = cv2.connectedComponents(mask)
+    for lbl in range(1, num_labels):
+        comp_mask = np.uint8(comp_labels == lbl)
+        comp_dist = dist_norm * comp_mask
+        local_max = float(comp_dist.max())
+        if local_max > 0:
+            comp_fg = np.uint8(comp_dist >= 0.35 * local_max) * 255
+            sure_fg = cv2.bitwise_or(sure_fg, comp_fg)
 
-    _, sure_fg = cv2.threshold(dist_norm, fg_thresh, 1, cv2.THRESH_BINARY)
-    sure_fg    = np.uint8(sure_fg * 255)
-
-    kernel     = np.ones((3, 3), np.uint8)
-    sure_bg    = cv2.dilate(mask, kernel, iterations=4)
-    unknown    = cv2.subtract(sure_bg, sure_fg)
+    kernel  = np.ones((3, 3), np.uint8)
+    sure_bg = cv2.dilate(mask, kernel, iterations=4)
+    unknown = cv2.subtract(sure_bg, sure_fg)
 
     _, markers = cv2.connectedComponents(sure_fg)
-    markers    = markers + 1
+    markers = markers + 1
     markers[unknown == 255] = 0
 
     markers = cv2.watershed(annotated.copy(), markers)
-    annotated[markers == -1] = [0, 0, 200]   # thin red boundary
+    annotated[markers == -1] = [0, 0, 200]
 
-    # ── Analyse each region ─────────────────────────────────────────────────
     total_count  = 0
     pill_regions = []
 
     for label in np.unique(markers):
         if label <= 1:
             continue
-
         region_mask = np.uint8(markers == label) * 255
-        cnts, _     = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
             continue
-
         contour     = max(cnts, key=cv2.contourArea)
         region_area = cv2.contourArea(contour)
-
         if region_area < ref_area * 0.10:
             continue
 
-        # ── Estimate count for this region ──────────────────────────────────
         area_count   = max(1, round(region_area / ref_area))
         maxima_count = _count_maxima(dist_norm, region_mask, ref_radius)
+        pill_count   = _reconcile_counts(area_count, maxima_count, region_area, ref_area)
 
-        pill_count = _reconcile_counts(area_count, maxima_count, region_area, ref_area)
-
-        # ── Shape validation ─────────────────────────────────────────────────
         if ref_shape is not None and pill_count == 1:
             metrics = _shape_metrics(contour)
-            tols    = {"circularity": 0.35,
-                       "aspect_ratio": 0.32,
-                       "solidity":     0.25}
+            tols = {"circularity": 0.40, "aspect_ratio": 0.40, "solidity": 0.45}
             if not all(abs(metrics[k] - ref_shape[k]) <= tols[k] for k in tols):
-                continue   # reject — shape doesn't match reference pill
+                continue
 
         if ref_shape is not None and pill_count > 1:
-            # Multi-pill blobs: require reasonable solidity so that highly
-            # irregular background blobs (low solidity) are rejected.
-            metrics  = _shape_metrics(contour)
+            metrics = _shape_metrics(contour)
             if metrics["solidity"] < ref_shape["solidity"] - 0.45:
-                continue   # too irregular to be a pill cluster
+                continue
 
         total_count += pill_count
         pill_regions.append((contour, region_area, pill_count))
