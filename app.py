@@ -86,19 +86,19 @@ def analyze():
         ref_image   = load_image_from_file(ref_file)
         group_image = load_image_from_file(group_file)
 
-        ref_area, color_profiles, is_white, ref_shape, bg_model = analyze_reference(ref_image)
+        ref_area, pill_hist, bg_hist, is_achromatic, ref_shape = analyze_reference(ref_image)
 
         count, annotated_image = count_pills(
-            group_image, ref_area, color_profiles,
-            is_white=is_white, ref_shape=ref_shape, bg_model=bg_model,
+            group_image, ref_area, pill_hist, bg_hist,
+            is_achromatic=is_achromatic, ref_shape=ref_shape,
         )
 
         return jsonify({
             "count":              count,
             "annotated_image":    encode_image_to_base64(annotated_image),
             "ref_area_px":        round(ref_area, 1),
-            "is_white_pill":      is_white,
-            "num_color_clusters": len(color_profiles),
+            "is_white_pill":      is_achromatic,
+            "num_color_clusters": 1,
         })
 
     except ValueError as e:
