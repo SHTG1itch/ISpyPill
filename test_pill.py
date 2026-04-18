@@ -21,16 +21,16 @@ print('=== Test set 1: white oval pills on blue tray ===')
 img1_ref = load_image('IMG_1241.JPG')
 img1_grp = load_image('IMG_1242.JPG')
 
-ref_area, color_profiles, is_white, ref_shape, bg_model = analyze_reference(img1_ref)
-print('ref_area:', round(ref_area, 1), '| is_white:', is_white)
+ref_area, pill_hist, bg_hist, is_achromatic, ref_shape = analyze_reference(img1_ref)
+print('ref_area:', round(ref_area, 1), '| is_achromatic:', is_achromatic)
 
-count1, ann1 = count_pills(img1_ref, ref_area, color_profiles,
-                           is_white=is_white, ref_shape=ref_shape, bg_model=bg_model)
+count1, ann1 = count_pills(img1_ref, ref_area, pill_hist, bg_hist,
+                           is_achromatic=is_achromatic, ref_shape=ref_shape)
 print('Single-pill self-test (IMG_1241):', count1, '(expected: 1)')
 cv2.imwrite('result_white_single.jpg', ann1)
 
-count2, ann2 = count_pills(img1_grp, ref_area, color_profiles,
-                           is_white=is_white, ref_shape=ref_shape, bg_model=bg_model)
+count2, ann2 = count_pills(img1_grp, ref_area, pill_hist, bg_hist,
+                           is_achromatic=is_achromatic, ref_shape=ref_shape)
 print('Group photo     (IMG_1242):', count2, '(expected: ~25)')
 cv2.imwrite('result_white_group.jpg', ann2)
 
@@ -40,16 +40,16 @@ print('=== Test set 2: orange round pills on gray tray ===')
 img2_ref = load_image('IMG_1243.jpeg')
 img2_grp = load_image('IMG_1244.jpeg')
 
-ref_area2, color_profiles2, is_white2, ref_shape2, bg_model2 = analyze_reference(img2_ref)
-print('ref_area:', round(ref_area2, 1), '| is_white:', is_white2)
+ref_area2, pill_hist2, bg_hist2, is_achromatic2, ref_shape2 = analyze_reference(img2_ref)
+print('ref_area:', round(ref_area2, 1), '| is_achromatic:', is_achromatic2)
 
-count3, ann3 = count_pills(img2_ref, ref_area2, color_profiles2,
-                           is_white=is_white2, ref_shape=ref_shape2, bg_model=bg_model2)
+count3, ann3 = count_pills(img2_ref, ref_area2, pill_hist2, bg_hist2,
+                           is_achromatic=is_achromatic2, ref_shape=ref_shape2)
 print('Single-pill self-test (IMG_1243):', count3, '(expected: 1)')
 cv2.imwrite('result_orange_single.jpg', ann3)
 
-count4, ann4 = count_pills(img2_grp, ref_area2, color_profiles2,
-                           is_white=is_white2, ref_shape=ref_shape2, bg_model=bg_model2)
+count4, ann4 = count_pills(img2_grp, ref_area2, pill_hist2, bg_hist2,
+                           is_achromatic=is_achromatic2, ref_shape=ref_shape2)
 print('Group photo     (IMG_1244):', count4, '(expected: 5)')
 cv2.imwrite('result_orange_group.jpg', ann4)
 

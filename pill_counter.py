@@ -57,15 +57,32 @@ def _enhance(image_np):
 
 def _achromatic_mask(bgr: np.ndarray) -> np.ndarray:
     """
-    Binary mask for white/grey pills: CLAHE on LAB L-channel then Otsu.
-    Automatically picks normal or inverted threshold (whichever covers ≤50%).
+    Binary mask for white/grey pills: CLAHE on LAB L-channel + saturation gate.
+
+    Combining L-channel Otsu with a low-saturation requirement (S < 45) excludes
+    colored backgrounds (blue trays, orange surfaces) that would otherwise appear
+    as bright white regions and inflate pill counts.
     """
     enhanced = _enhance(bgr)
     lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
     l_ch = lab[:, :, 0]
-    _, mask = cv2.threshold(l_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    s_ch = hsv[:, :, 1]
+
+    _, l_mask = cv2.threshold(l_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Saturation gate: keeps only achromatic (white/grey) pixels; excludes colored surfaces
+    sat_gate = np.uint8(s_ch < 45) * 255
+    mask = cv2.bitwise_and(l_mask, sat_gate)
+
     h, w = mask.shape
     fill = float(np.sum(mask > 0)) / (h * w)
+
+    # If saturation gate made the mask too sparse, fall back to L-channel only
+    if fill < 0.005:
+        fill_l = float(np.sum(l_mask > 0)) / (h * w)
+        return cv2.bitwise_not(l_mask) if fill_l > 0.5 else l_mask
+
     return cv2.bitwise_not(mask) if fill > 0.5 else mask
 
 
@@ -81,12 +98,11 @@ def _build_probability_mask(group_bgr: np.ndarray,
     """
     Return a binary mask of pill pixels in group_bgr.
 
-    Chromatic path  — histogram backprojection on the ratio histogram.
-    Achromatic path — CLAHE + LAB L-channel Otsu (brightness-based).
+    Always tries histogram backprojection first using the HS ratio histogram.
+    This works for both chromatic AND achromatic pills when the background has
+    a distinct hue/saturation (e.g., white pill on blue tray). Falls back to
+    _achromatic_mask when backprojection is degenerate (e.g., white on gray).
     """
-    if is_achromatic:
-        return _achromatic_mask(group_bgr)
-
     # Ratio histogram: bins where pills dominate background get high values
     ratio_hist = (pill_hist + 1e-6) / (bg_hist + 1e-6)
     cv2.normalize(ratio_hist, ratio_hist, 0, 255, cv2.NORM_MINMAX)
@@ -121,17 +137,19 @@ def _build_probability_mask(group_bgr: np.ndarray,
 
 def _fallback_ref_contour(image_np: np.ndarray) -> np.ndarray:
     """
-    Otsu-based fallback for reference pill extraction when GrabCut fails.
-    Tries both normal and inverted Otsu; picks the contour closest to image
-    center that passes area and solidity filters.
+    Otsu-based fallback for reference pill extraction.
+
+    Scores contours by solidity × circularity; prefers smaller single-pill-sized
+    candidates (< 30% of image) over large background blobs. Falls back to
+    nearest-center selection only when no small pill-like region is found.
     """
     h, w = image_np.shape[:2]
     img_area = h * w
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
     center = np.array([w / 2.0, h / 2.0])
-    best, best_dist = None, float("inf")
 
+    all_candidates = []
     for flags in [cv2.THRESH_BINARY + cv2.THRESH_OTSU,
                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU]:
         _, thresh = cv2.threshold(gray, 0, 255, flags)
@@ -141,23 +159,33 @@ def _fallback_ref_contour(image_np: np.ndarray) -> np.ndarray:
             if not (0.02 * img_area <= area <= 0.85 * img_area):
                 continue
             hull_a = cv2.contourArea(cv2.convexHull(c)) + 1e-6
-            if area / hull_a < 0.3:
+            solidity = area / hull_a
+            if solidity < 0.3:
                 continue
             M = cv2.moments(c)
             if M["m00"] == 0:
                 continue
+            perimeter = cv2.arcLength(c, True)
+            circ = 4 * np.pi * area / (perimeter ** 2 + 1e-6)
             cx = M["m10"] / M["m00"]
             cy = M["m01"] / M["m00"]
-            d = float(np.hypot(cx - center[0], cy - center[1]))
-            if d < best_dist:
-                best_dist, best = d, c
+            dist = float(np.hypot(cx - center[0], cy - center[1]))
+            all_candidates.append((c, area, solidity, circ, dist))
 
-    if best is None:
-        raise ValueError(
-            "Could not isolate the reference pill. "
-            "Use a photo with the pill clearly visible against a contrasting background."
-        )
-    return best
+    # Primary: find the most pill-like contour among single-pill-sized candidates
+    # (< 30% of image). Pills have high solidity and at least moderate circularity.
+    single_pill = [t for t in all_candidates if t[1] < img_area * 0.30]
+    if single_pill:
+        return max(single_pill, key=lambda t: t[2] * max(0.1, t[3]))[0]
+
+    # Fallback: nothing small found — pick nearest to center (original behaviour)
+    if all_candidates:
+        return min(all_candidates, key=lambda t: t[4])[0]
+
+    raise ValueError(
+        "Could not isolate the reference pill. "
+        "Use a photo with the pill clearly visible against a contrasting background."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,31 +235,91 @@ def _estimate_scale(mask: np.ndarray, ref_area: float) -> float:
     """
     Estimate true pill area in mask when group photo distance differs from reference.
 
-    Collects blobs in [20%, 300%] of ref_area (single-pill candidates) and returns
-    their plain median. Falls back to ref_area when no candidates are found.
+    Two-pass approach:
+    1. Prefer blobs in [0.5×, 2.0×] ref_area — single-pill-sized candidates that
+       give reliable n=1 estimates even when the background contains similar-coloured
+       noise (e.g. white countertop mis-detected alongside white pills).
+    2. Fall back to [10%, min(1000%, 50 000 px)] when no single-pill blobs exist —
+       covers the common case where the group photo is at a different distance and
+       all isolated pills are smaller than 0.5× ref_area.
+    Uses the median of per-pill area / n_maxima across accepted blobs.
     """
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return ref_area
 
-    lo_cap = ref_area * 0.20
-    hi_cap = ref_area * 3.0
-    candidates = sorted(
-        [cv2.contourArea(c) for c in cnts if lo_cap <= cv2.contourArea(c) <= hi_cap]
-    )
+    def _per_pill(c, area):
+        """Return per-pill area estimate for one blob, or None if blob is non-solid."""
+        hull_a = cv2.contourArea(cv2.convexHull(c)) + 1e-6
+        if area / hull_a < 0.60:
+            return None
+        blob_m = np.zeros(mask.shape, np.uint8)
+        cv2.drawContours(blob_m, [c], -1, 255, -1)
+        dist = cv2.distanceTransform(blob_m, cv2.DIST_L2, 5)
+        if dist.max() > 0:
+            # Window sized to 70% of blob radius. This spans most of the blob
+            # so that only true DT peaks (pill centres) satisfy dist==local_max
+            # and false shoulder maxima near the border are suppressed.
+            est_r = max(8, int(np.sqrt(area / np.pi) * 0.70))
+            local_max = ndimage.maximum_filter(dist, size=2 * est_r + 1)
+            peaks = (dist == local_max) & (dist >= dist.max() * 0.35)
+            _, n = ndimage.label(peaks)
+            n = max(1, n)
+        else:
+            n = 1
+        return area / n
 
-    if not candidates:
-        all_areas = sorted(
-            [cv2.contourArea(c) for c in cnts if cv2.contourArea(c) >= ref_area * 0.15]
-        )
-        if not all_areas:
-            return ref_area
-        smallest = all_areas[0]
-        n_est = max(1, round(smallest / ref_area))
-        return float(np.clip(smallest / n_est, ref_area / 8.0, ref_area * 8.0))
+    # Pass 1: single-pill-sized blobs — most reliable scale signal.
+    # These are blobs close to ref_area and therefore contain 1 (or a small
+    # number of) pills whose n_maxima is straightforward to count accurately.
+    sp_lo = ref_area * 0.50
+    sp_hi = ref_area * 2.00
+    single_pill_estimates = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if not (sp_lo <= area <= sp_hi):
+            continue
+        est = _per_pill(c, area)
+        if est is not None:
+            single_pill_estimates.append(est)
 
-    estimated = float(np.median(candidates))
-    return float(np.clip(estimated, ref_area / 8.0, ref_area * 4.0))
+    if single_pill_estimates:
+        estimated = float(np.median(single_pill_estimates))
+        return float(np.clip(estimated, ref_area / 10.0, ref_area * 10.0))
+
+    # Pass 2: general range — used when group photo is far enough from camera
+    # that individual pills appear much smaller than the close-up reference.
+    lo_cap = ref_area * 0.10   # noise blobs are typically < 10% of a real pill
+    hi_cap = min(ref_area * 10.0, 50_000)
+    per_pill_estimates = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if not (lo_cap <= area <= hi_cap):
+            continue
+        est = _per_pill(c, area)
+        if est is not None:
+            per_pill_estimates.append(est)
+
+    if per_pill_estimates:
+        estimated = float(np.median(per_pill_estimates))
+        return float(np.clip(estimated, ref_area / 10.0, ref_area * 10.0))
+
+    # No blobs in either range — fall back to largest solid blob so _clean_mask
+    # kernels are proportional to detected pill size rather than ref_area.
+    best_area = None
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 100:
+            continue
+        hull_a = cv2.contourArea(cv2.convexHull(c)) + 1e-6
+        if area / hull_a < 0.50:
+            continue
+        if best_area is None or area > best_area:
+            best_area = area
+
+    if best_area is not None:
+        return float(np.clip(best_area, ref_area / 10.0, ref_area * 4.0))
+    return ref_area
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,13 +410,13 @@ def _watershed_count(mask: np.ndarray,
 
         if ref_shape is not None and pill_count == 1:
             metrics = _shape_metrics(contour)
-            tols = {"circularity": 0.40, "aspect_ratio": 0.40, "solidity": 0.45}
+            tols = {"circularity": 0.35, "aspect_ratio": 0.30, "solidity": 0.40}
             if not all(abs(metrics[k] - ref_shape[k]) <= tols[k] for k in tols):
                 continue
 
         if ref_shape is not None and pill_count > 1:
             metrics = _shape_metrics(contour)
-            if metrics["solidity"] < ref_shape["solidity"] - 0.45:
+            if metrics["solidity"] < ref_shape["solidity"] - 0.40:
                 continue
 
         total_count += pill_count
@@ -502,9 +590,27 @@ def analyze_reference(image_np):
         if d < best_dist:
             best_dist, ref_contour = d, c
 
-    # ── Fallback if GrabCut found nothing valid ─────────────────────────────
-    if ref_contour is None:
-        ref_contour = _fallback_ref_contour(image_np)
+    # ── Otsu-based fallback always computed for comparison ──────────────────
+    try:
+        fallback_contour = _fallback_ref_contour(image_np)
+    except ValueError:
+        fallback_contour = None
+
+    # ── Choose between GrabCut and fallback ────────────────────────────────
+    # GrabCut often captures a large rect region when the pill is small relative
+    # to the central 60% rectangle. Prefer the Otsu fallback when GrabCut's
+    # contour is significantly larger (>1.5×) — the fallback uses contrast-based
+    # segmentation which is more reliable for single-pill close-ups.
+    if ref_contour is not None and fallback_contour is not None:
+        if cv2.contourArea(ref_contour) > 1.5 * cv2.contourArea(fallback_contour):
+            ref_contour = fallback_contour
+    elif ref_contour is None:
+        if fallback_contour is None:
+            raise ValueError(
+                "Could not isolate the reference pill. "
+                "Use a photo with the pill clearly visible against a contrasting background."
+            )
+        ref_contour = fallback_contour
 
     ref_area = float(cv2.contourArea(ref_contour))
     if ref_area < 80:
@@ -533,10 +639,17 @@ def analyze_reference(image_np):
     cv2.normalize(pill_hist, pill_hist, 0, 255, cv2.NORM_MINMAX)
     cv2.normalize(bg_hist,   bg_hist,   0, 255, cv2.NORM_MINMAX)
 
-    # ── Achromatic detection ─────────────────────────────────────────────────
-    pill_hsv_px = hsv_img[pill_mask == 255]
-    if len(pill_hsv_px) > 0:
-        is_achromatic = bool(np.mean(pill_hsv_px[:, 1] < 30) > 0.80)
+    # ── Achromatic detection via center crop of bounding box ─────────────────
+    # Sample the inner 50% of the ref_contour bounding box to avoid including
+    # background pixels at the contour edges (common when GrabCut is imprecise).
+    rx, ry, rw, rh = cv2.boundingRect(ref_contour)
+    cx_s = rx + rw // 4
+    cy_s = ry + rh // 4
+    cx_e = rx + 3 * rw // 4
+    cy_e = ry + 3 * rh // 4
+    sample_px = hsv_img[cy_s:cy_e, cx_s:cx_e].reshape(-1, 3)
+    if len(sample_px) > 0:
+        is_achromatic = bool(np.mean(sample_px[:, 1] < 30) > 0.80)
     else:
         is_achromatic = True
 
@@ -574,11 +687,16 @@ def count_pills(group_image_np, ref_area, pill_hist, bg_hist,
         group_image_np, pill_hist, bg_hist, ref_radius, is_achromatic
     )
 
-    # Estimate effective pill size in case group photo was at different distance
-    eff_area   = _estimate_scale(mask, ref_area)
+    # Minimal denoise before scale estimation so small kernel won't destroy pills
+    pre_k = np.ones((5, 5), np.uint8)
+    mask_pre = cv2.morphologyEx(mask, cv2.MORPH_OPEN, pre_k, iterations=1)
+
+    # Estimate effective pill size — the group photo may be farther away than the reference
+    eff_area   = _estimate_scale(mask_pre, ref_area)
     eff_radius = float(np.sqrt(eff_area / np.pi))
 
-    mask = _clean_mask(mask, eff_radius)
+    # Full adaptive cleanup now that we know the correct scale
+    mask = _clean_mask(mask_pre, eff_radius)
 
     total, annotated, dist_norm, regions = _watershed_count(
         mask, annotated, eff_area, eff_radius, ref_shape
@@ -599,12 +717,12 @@ def count_pills(group_image_np, ref_area, pill_hist, bg_hist,
 
             if ref_shape is not None and pc == 1:
                 metrics = _shape_metrics(c)
-                tols = {"circularity": 0.40, "aspect_ratio": 0.40, "solidity": 0.45}
+                tols = {"circularity": 0.35, "aspect_ratio": 0.30, "solidity": 0.40}
                 if not all(abs(metrics[k] - ref_shape[k]) <= tols[k] for k in tols):
                     continue
             elif ref_shape is not None and pc > 1:
                 metrics = _shape_metrics(c)
-                if metrics["solidity"] < ref_shape["solidity"] - 0.45:
+                if metrics["solidity"] < ref_shape["solidity"] - 0.40:
                     continue
 
             total += pc
