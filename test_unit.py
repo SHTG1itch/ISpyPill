@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import pytest
-from pill_counter import _fallback_ref_contour, analyze_reference
+from pill_counter import _fallback_ref_contour, analyze_reference, _achromatic_mask
 
 
 def make_pill_on_bg(bg_color=(80, 80, 80), pill_color=(230, 230, 230), size=300):
@@ -60,3 +60,14 @@ def test_analyze_reference_detects_chromatic():
 def test_analyze_reference_raises_on_empty():
     with pytest.raises(ValueError):
         analyze_reference(np.zeros((0, 0, 3), dtype=np.uint8))
+
+
+# ── Task 3: _achromatic_mask ──────────────────────────────────────────────────
+
+def test_achromatic_mask_detects_white_region():
+    img = np.zeros((200, 200, 3), dtype=np.uint8)
+    img[:, 100:] = 240  # right half bright white
+    mask = _achromatic_mask(img)
+    left_fill  = np.sum(mask[:, :100]  > 0)
+    right_fill = np.sum(mask[:, 100:] > 0)
+    assert right_fill > left_fill * 2

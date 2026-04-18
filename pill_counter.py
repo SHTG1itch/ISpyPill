@@ -52,6 +52,24 @@ def _enhance(image_np):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Achromatic mask (white/grey pills)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _achromatic_mask(bgr: np.ndarray) -> np.ndarray:
+    """
+    Binary mask for white/grey pills: CLAHE on LAB L-channel then Otsu.
+    Automatically picks normal or inverted threshold (whichever covers ≤50%).
+    """
+    enhanced = _enhance(bgr)
+    lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+    l_ch = lab[:, :, 0]
+    _, mask = cv2.threshold(l_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    h, w = mask.shape
+    fill = float(np.sum(mask > 0)) / (h * w)
+    return cv2.bitwise_not(mask) if fill > 0.5 else mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Fallback reference contour selector
 # ─────────────────────────────────────────────────────────────────────────────
 
