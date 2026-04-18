@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from pill_counter import (_fallback_ref_contour, analyze_reference, _achromatic_mask,
                           _build_probability_mask, _estimate_scale, _reconcile_counts,
-                          _watershed_count)
+                          _watershed_count, count_pills)
 
 
 def make_pill_on_bg(bg_color=(80, 80, 80), pill_color=(230, 230, 230), size=300):
@@ -180,3 +180,21 @@ def test_watershed_counts_touching_pills():
 
     total, _, _, regions = _watershed_count(mask, annotated, ref_area, ref_radius, ref_shape=None)
     assert abs(total - n) <= 1, f"Expected ~{n} pills, got {total}"
+
+
+# ── Task 7: count_pills integration ──────────────────────────────────────────
+
+def test_count_pills_synthetic():
+    pill_color = (30, 150, 200)
+    bg_color   = (80, 80, 80)
+    n = 5
+
+    ref_img   = make_pill_on_bg(bg_color=bg_color, pill_color=pill_color, size=200)
+    group_img, r = make_group_image(bg_color=bg_color, pill_color=pill_color, n=n)
+
+    ref_area, pill_hist, bg_hist, is_achromatic, ref_shape = analyze_reference(ref_img)
+    count, annotated = count_pills(group_img, ref_area, pill_hist, bg_hist,
+                                   is_achromatic=is_achromatic, ref_shape=ref_shape)
+
+    assert annotated.shape == group_img.shape
+    assert abs(count - n) <= 2, f"Expected ~{n} pills, got {count}"
