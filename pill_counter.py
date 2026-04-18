@@ -52,6 +52,51 @@ def _enhance(image_np):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fallback reference contour selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fallback_ref_contour(image_np: np.ndarray) -> np.ndarray:
+    """
+    Otsu-based fallback for reference pill extraction when GrabCut fails.
+    Tries both normal and inverted Otsu; picks the contour closest to image
+    center that passes area and solidity filters.
+    """
+    h, w = image_np.shape[:2]
+    img_area = h * w
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+    center = np.array([w / 2.0, h / 2.0])
+    best, best_dist = None, float("inf")
+
+    for flags in [cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU]:
+        _, thresh = cv2.threshold(gray, 0, 255, flags)
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if not (0.02 * img_area <= area <= 0.85 * img_area):
+                continue
+            hull_a = cv2.contourArea(cv2.convexHull(c)) + 1e-6
+            if area / hull_a < 0.3:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+            d = float(np.hypot(cx - center[0], cy - center[1]))
+            if d < best_dist:
+                best_dist, best = d, c
+
+    if best is None:
+        raise ValueError(
+            "Could not isolate the reference pill. "
+            "Use a photo with the pill clearly visible against a contrasting background."
+        )
+    return best
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Local-maxima counting (cross-check for area ratio)
 # ─────────────────────────────────────────────────────────────────────────────
 
