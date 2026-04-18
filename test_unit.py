@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 from pill_counter import (_fallback_ref_contour, analyze_reference, _achromatic_mask,
-                          _build_probability_mask)
+                          _build_probability_mask, _estimate_scale, _reconcile_counts)
 
 
 def make_pill_on_bg(bg_color=(80, 80, 80), pill_color=(230, 230, 230), size=300):
@@ -113,3 +113,43 @@ def test_backprojection_uses_achromatic_fallback():
     h, w = mask.shape
     fill = np.sum(mask > 0) / (h * w)
     assert 0.01 < fill < 0.99
+
+
+# ── Task 5: _estimate_scale and _reconcile_counts ─────────────────────────────
+
+def make_mask_with_blobs(blob_area=5000, n=6, size=800):
+    mask = np.zeros((size, size), dtype=np.uint8)
+    side = int(np.sqrt(blob_area))
+    cols = 3
+    for i in range(n):
+        r, c = divmod(i, cols)
+        x = 50 + c * (side + 50)
+        y = 50 + r * (side + 50)
+        mask[y:y+side, x:x+side] = 255
+    return mask
+
+
+def test_estimate_scale_returns_median_of_candidates():
+    blob_area = 4000
+    mask = make_mask_with_blobs(blob_area=blob_area, n=6)
+    estimated = _estimate_scale(mask, ref_area=blob_area)
+    assert 0.6 * blob_area <= estimated <= 1.4 * blob_area
+
+
+def test_estimate_scale_fallback_on_empty():
+    mask = np.zeros((200, 200), dtype=np.uint8)
+    result = _estimate_scale(mask, ref_area=1000.0)
+    assert result == 1000.0
+
+
+def test_reconcile_counts_agrees_within_one():
+    assert _reconcile_counts(5, 5, 5000, 1000) == 5
+    assert _reconcile_counts(5, 6, 5000, 1000) == 5
+
+
+def test_reconcile_counts_maxima_sanity_check():
+    assert _reconcile_counts(3, 7, 3000, 1000) == 4
+
+
+def test_reconcile_counts_area_wins_otherwise():
+    assert _reconcile_counts(4, 1, 4000, 1000) == 4

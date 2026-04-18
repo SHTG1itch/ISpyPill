@@ -536,63 +536,33 @@ def _best_mask(enhanced_bgr: np.ndarray,
 
 def _estimate_scale(mask: np.ndarray, ref_area: float) -> float:
     """
-    Estimate the true pill area in *mask* when the group photo was taken
-    from a different distance than the reference shot.
+    Estimate true pill area in mask when group photo distance differs from reference.
 
-    Strategy
-    --------
-    1. Collect all blobs in the range [5 % – 200 %] of ref_area.
-       These are blobs that could plausibly be 1–2 individual pills.
-    2. Return the median of the *upper* half of those blobs.
-       Larger blobs within the valid range are more likely to be complete,
-       isolated pills (smaller blobs may be clipped at boundaries or split).
-
-    Falls back to ref_area when not enough data is available.
+    Collects blobs in [20%, 300%] of ref_area (single-pill candidates) and returns
+    their plain median. Falls back to ref_area when no candidates are found.
     """
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return ref_area
 
-    # Collect blobs in [5 %, 200 %] of ref_area — individual-pill candidates
-    lo_cap = ref_area * 0.05
-    hi_cap = ref_area * 2.0
+    lo_cap = ref_area * 0.20
+    hi_cap = ref_area * 3.0
     candidates = sorted(
-        [cv2.contourArea(c) for c in cnts
-         if lo_cap <= cv2.contourArea(c) <= hi_cap]
+        [cv2.contourArea(c) for c in cnts if lo_cap <= cv2.contourArea(c) <= hi_cap]
     )
 
     if not candidates:
-        # No blobs in the individual-pill range.
-        # All blobs are large → divide the smallest one by its implied n.
-        all_areas = sorted([cv2.contourArea(c) for c in cnts if cv2.contourArea(c) >= lo_cap])
+        all_areas = sorted(
+            [cv2.contourArea(c) for c in cnts if cv2.contourArea(c) >= ref_area * 0.15]
+        )
         if not all_areas:
             return ref_area
-        smallest_large = all_areas[0]
-        n_est = max(1, round(smallest_large / ref_area))
-        estimated = smallest_large / n_est
-        return float(np.clip(estimated, ref_area / 8.0, ref_area * 8.0))
+        smallest = all_areas[0]
+        n_est = max(1, round(smallest / ref_area))
+        return float(np.clip(smallest / n_est, ref_area / 8.0, ref_area * 8.0))
 
-    # Use an area-weighted median rather than the plain or upper-half median.
-    # Plain median is pulled down by small noise blobs (white pill case:
-    # many tiny background blobs reduce eff_area by half, mis-classifying the
-    # pill as a 2-pill region). Upper-half median is biased upward by any
-    # merged 2-pill blobs (orange pill case: merged 58K blob pulls estimate to
-    # 44K, so the same 58K blob rounds to area_count=1 instead of 2).
-    # Weighting each blob by its own area prioritises larger, more pill-like
-    # blobs and naturally handles both cases.
-    sorted_cands = sorted(candidates)
-    total_weight = sum(sorted_cands)
-    cumulative   = 0.0
-    estimated    = float(sorted_cands[-1])  # fallback: largest blob
-    for a in sorted_cands:
-        cumulative += a
-        if cumulative >= total_weight * 0.5:
-            estimated = float(a)
-            break
-
-    # Sanity: clamp to 1/8 – 4× the reference area
-    estimated = float(np.clip(estimated, ref_area / 8.0, ref_area * 4.0))
-    return estimated
+    estimated = float(np.median(candidates))
+    return float(np.clip(estimated, ref_area / 8.0, ref_area * 4.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -709,27 +679,14 @@ def _watershed_count(mask: np.ndarray,
 def _reconcile_counts(area_count: int, maxima_count: int,
                       region_area: float, ref_area: float) -> int:
     """
-    Combine the area-ratio estimate and the local-maxima estimate.
-
-    Strategy
-    --------
-    • If they agree within 1 → use area_count (lower variance).
-    • If maxima >> area  → pills are denser than ref; trust maxima.
-    • If area >> maxima  → pills may be stacked; prefer area but cap it.
-    • Tie-break: pick whichever gives a ratio closest to an integer.
+    Primary: use area_count.
+    Sanity check: if maxima_count >= 2× area_count, pills are likely over-merged — add 1.
     """
     if abs(area_count - maxima_count) <= 1:
         return area_count
-
-    # How far each estimate is from a "clean" integer multiple of ref_area
-    ratio = region_area / ref_area
-    area_err   = abs(ratio - round(ratio))
-    maxima_err = abs(ratio - maxima_count)
-
-    if area_err <= maxima_err:
-        return area_count
-    else:
-        return maxima_count
+    if maxima_count >= 2 * area_count:
+        return area_count + 1
+    return area_count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
