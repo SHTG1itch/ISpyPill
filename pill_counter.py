@@ -365,6 +365,71 @@ def _largest_filled_regions(binary: np.ndarray, min_frac: float,
     return keep, filled
 
 
+def _recover_border_pills(side_is_pill: np.ndarray, roi: np.ndarray,
+                          tray_core: np.ndarray, img_area: float) -> np.ndarray:
+    """
+    Recover pills that touch the image border and are therefore lost by the
+    "pill = enclosed hole in the tray" model: a pill at the frame edge is an
+    OPEN notch, not a hole, so :func:`binary_fill_holes` never recovers it and
+    it is dropped — a systematic undercount whenever a pill is partly cropped.
+
+    A border pill is a pill-side component that (a) touches the image edge,
+    (b) lies outside the filled ROI, (c) is wrapped by the tray on its
+    non-border sides, and (d) is no larger than a small cluster of pills.  The
+    tray-surround AND size gates are deliberately strict so same-coloured
+    material OUTSIDE the tray (e.g. a white counter behind white pills) — which
+    is large and NOT tray-wrapped — can never be admitted.  This keeps the fix
+    from ever introducing an overcount; it only restores genuinely cropped
+    pills sitting on the tray.
+
+    Returns a mask of the recovered border-pill pixels (may be all-zero).
+    """
+    h, w = side_is_pill.shape
+    # Recovery is only SAFE when the tray fills the frame: then any pill-coloured
+    # material at the image edge must be a cropped pill, because there is no
+    # off-tray background there to mistake for one.  If the tray does NOT dominate
+    # the image-border ring, real background (a counter/table around a central
+    # tray) reaches the edges, and recovering border components would grab it —
+    # an overcount.  So bail out unless the tray clearly wraps the whole frame.
+    border_ring = np.zeros((h, w), bool)
+    border_ring[0, :] = border_ring[-1, :] = border_ring[:, 0] = border_ring[:, -1] = True
+    if (roi[border_ring] > 0).mean() < 0.55:
+        return np.zeros_like(side_is_pill)
+
+    outside = cv2.bitwise_and(side_is_pill, cv2.bitwise_not(roi))
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(outside, 8)
+    add = np.zeros_like(side_is_pill)
+    tray_bool = tray_core > 0
+    rk = max(3, int(round(np.sqrt(img_area) * 0.01))) | 1
+    ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rk, rk))
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        x  = stats[i, cv2.CC_STAT_LEFT]
+        y  = stats[i, cv2.CC_STAT_TOP]
+        bw = stats[i, cv2.CC_STAT_WIDTH]
+        bh = stats[i, cv2.CC_STAT_HEIGHT]
+        touches = (x == 0 or y == 0 or x + bw >= w or y + bh >= h)
+        if not touches:
+            continue
+        # A cropped pill (or a small just-touching cluster) is small; the
+        # external counter / off-tray background is large -> reject it outright.
+        if area > 0.06 * img_area or area < 0.0006 * img_area:
+            continue
+        comp = labels == i
+        comp_u = (comp.astype(np.uint8)) * 255
+        ring = cv2.dilate(comp_u, ring_kernel) > 0
+        ring &= ~comp
+        # Ignore the image-border portion of the ring — only the inward sides
+        # tell us whether the tray wraps the object.
+        ring[0, :] = ring[-1, :] = ring[:, 0] = ring[:, -1] = False
+        ring_n = int(ring.sum())
+        if ring_n == 0:
+            continue
+        if (ring & tray_bool).sum() / ring_n >= 0.55:
+            add[comp] = 255
+    return add
+
+
 def _tray_and_pills(side_is_tray: np.ndarray, side_is_pill: np.ndarray,
                     img_area: float):
     """
@@ -374,11 +439,18 @@ def _tray_and_pills(side_is_tray: np.ndarray, side_is_pill: np.ndarray,
     The tray is the dominant connected region of *side_is_tray*; filling its
     holes recovers the pills resting on it, and intersecting the pill side with
     that ROI discards same-coloured material OUTSIDE the tray (e.g. a white
-    counter behind white pills).
+    counter behind white pills).  A final pass restores pills that are cropped
+    by the frame edge (open notches the hole-fill cannot recover) when — and
+    only when — the tray demonstrably wraps them, so the count is never
+    inflated by off-tray background.
     """
-    _, roi = _largest_filled_regions(side_is_tray, 0.04, img_area)
+    tray_core, roi = _largest_filled_regions(side_is_tray, 0.04, img_area)
     if cv2.countNonZero(roi) >= 0.12 * img_area:
-        return roi, cv2.bitwise_and(side_is_pill, roi)
+        pill_mask = cv2.bitwise_and(side_is_pill, roi)
+        border = _recover_border_pills(side_is_pill, roi, tray_core, img_area)
+        if cv2.countNonZero(border):
+            pill_mask = cv2.bitwise_or(pill_mask, border)
+        return roi, pill_mask
     # Tray not found — treat the whole frame as ROI (colour/saturation only).
     full = np.full(side_is_tray.shape, 255, np.uint8)
     return full, side_is_pill
@@ -673,6 +745,7 @@ def _count_pills_in_mask(mask: np.ndarray, annotated: np.ndarray,
     if cv2.countNonZero(mask) == 0:
         return 0, annotated, []
 
+    h, w = mask.shape
     num, comp_labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     min_area = max(60, eff_area * 0.30)
 
@@ -682,6 +755,11 @@ def _count_pills_in_mask(mask: np.ndarray, annotated: np.ndarray,
         area = int(stats[ci, cv2.CC_STAT_AREA])
         if area < min_area:
             continue
+        x  = stats[ci, cv2.CC_STAT_LEFT]
+        y  = stats[ci, cv2.CC_STAT_TOP]
+        bw = stats[ci, cv2.CC_STAT_WIDTH]
+        bh = stats[ci, cv2.CC_STAT_HEIGHT]
+        touches_border = (x == 0 or y == 0 or x + bw >= w or y + bh >= h)
         comp = np.uint8(comp_labels == ci) * 255
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
@@ -699,7 +777,18 @@ def _count_pills_in_mask(mask: np.ndarray, annotated: np.ndarray,
             convex_full = (metrics["solidity"] >= 0.85 and
                            metrics["aspect_ratio"] >= 0.20 and
                            area >= 0.6 * eff_area)
-            if not (convex_full or _shape_is_pill_like(metrics, ref_shape, strict=True)):
+            # A pill cropped by the frame edge is TRUNCATED: it legitimately has
+            # less area and a cut-off (lower-circularity) outline, so the full-
+            # pill gates above wrongly drop it.  Any border-touching component
+            # that reaches this stage already survived the strict tray-surround
+            # and size test in _recover_border_pills, so accepting a solid,
+            # convex cropped blob as one pill cannot admit glare/background —
+            # it only restores genuinely cropped pills (never an overcount).
+            cropped_pill = (touches_border and
+                            metrics["solidity"] >= 0.80 and
+                            metrics["aspect_ratio"] >= 0.20)
+            if not (convex_full or cropped_pill or
+                    _shape_is_pill_like(metrics, ref_shape, strict=True)):
                 continue
             count = 1
         else:

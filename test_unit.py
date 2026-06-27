@@ -157,3 +157,64 @@ def test_count_pills_accuracy_by_type(pill, tray, shape):
     ref_area, ph, bh, achr, rs = analyze_reference(ref)
     count, _ = count_pills(grp, ref_area, ph, bh, is_achromatic=achr, ref_shape=rs)
     assert abs(count - gt) <= 1, f"{pill}/{tray}/{shape}: got {count}, expected {gt}"
+
+
+# ── real in-repo phone photos (catches overcounts the synthetic harness can't) ──
+
+def _load_real(path, max_dim=2000):
+    from PIL import Image, ImageOps
+    import io
+    with open(path, "rb") as f:
+        im = Image.open(io.BytesIO(f.read()))
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    w, h = im.size
+    if max(w, h) > max_dim:
+        s = max_dim / max(w, h)
+        im = im.resize((int(w * s), int(h * s)), Image.LANCZOS)
+    return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+
+
+# (reference, group, ground_truth, tolerance).  Real phone photos where the tray
+# does NOT fill the frame (counter/background at the edges) — the exact condition
+# under which an over-eager border-pill recovery overcounts.  The upper bound is
+# the real guard: the synthetic harness cannot catch this because its tray always
+# fills the frame.
+_REAL_CASES = [
+    ("IMG_1241.JPG",  "IMG_1242.JPG",  25, 3),   # white oval pills on blue tray
+    ("IMG_1243.jpeg", "IMG_1244.jpeg",  5, 1),   # orange round pills on gray tray
+]
+
+
+@pytest.mark.parametrize("ref_file,grp_file,gt,tol", _REAL_CASES)
+def test_real_photos_no_overcount(ref_file, grp_file, gt, tol):
+    here = os.path.dirname(os.path.abspath(__file__))
+    rp, gp = os.path.join(here, ref_file), os.path.join(here, grp_file)
+    if not (os.path.exists(rp) and os.path.exists(gp)):
+        pytest.skip(f"{ref_file}/{grp_file} not present")
+    ref, grp = _load_real(rp), _load_real(gp)
+    ra, ph, bh, achr, rs = analyze_reference(ref)
+    count, _ = count_pills(grp, ra, ph, bh, is_achromatic=achr, ref_shape=rs)
+    # Upper bound is the critical assertion: never overcount (pharmacy priority).
+    assert count <= gt + tol, f"{grp_file}: OVERCOUNT {count} (truth ~{gt})"
+    assert count >= gt - tol, f"{grp_file}: undercount {count} (truth ~{gt})"
+
+
+# ── border-cropped pills (regression: edge pills must not be dropped) ───────────
+
+@pytest.mark.parametrize("pill,tray,shape", [
+    ("white", "blue", "round"),
+    ("white", "gray", "oval"),
+    ("red", "gray", "round"),
+    ("orange", "blue", "capsule"),
+])
+def test_count_pills_recovers_border_cropped(pill, tray, shape):
+    """Pills touching the frame edge are open notches, not enclosed holes, so the
+    tray "hole-fill" model used to drop them entirely — a systematic undercount.
+    They must now be recovered when the tray wraps them."""
+    from tests.stress_probe import make_case_stress
+    ref, grp, gt = make_case_stress(7000 + hash((pill, tray, shape)) % 1000,
+                                    pill, tray, shape, n=8, touching=False,
+                                    border=True)
+    ref_area, ph, bh, achr, rs = analyze_reference(ref)
+    count, _ = count_pills(grp, ref_area, ph, bh, is_achromatic=achr, ref_shape=rs)
+    assert abs(count - gt) <= 1, f"{pill}/{tray}/{shape}: got {count}, expected {gt}"

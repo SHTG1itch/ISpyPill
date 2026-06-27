@@ -32,7 +32,8 @@
           "cameraPermission": "ISpyPill needs camera access to take photos of pills."
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-font"
     ]
   }
 }
