@@ -15,7 +15,7 @@ your machine**; your photos are never uploaded anywhere.
 | **Use case** | Medication management, inventory, accessibility |
 | **Runs on** | Web browser (desktop & mobile) and a native iOS/Android app |
 | **Privacy** | 100% local — no cloud, no accounts |
-| **Speed** | ~1–2 seconds per photo |
+| **Speed** | ~1–2 s for typical phone photos, up to ~10 s at the 2000 px cap |
 
 ---
 
@@ -433,11 +433,16 @@ python test_pill.py
 python tests/run_accuracy.py
 ```
 
-**Current accuracy** on the synthetic matrix (10 pill colours × 6 tray colours ×
-3 shapes × 5 counts, 240 cases): **~99.6% exact, mean error 0.02 pills.** The
-four bundled real photos are counted accurately (single‑pill self‑tests = 1,
-orange group exact, white group within ±1), as is the spread‑out real test image
-in `tests/online_images/` (6 pills, counted exactly).
+**Current accuracy** (measured, deterministic): on the synthetic matrix
+(16 pill/tray colour pairs × 3 shapes × 5 counts, 240 cases): **89% exact,
+96% within ±1, mean absolute error 0.44 pills.** On a set of 55 real phone
+photos of labelled pill spreads (19 medication types, 8–75 pills each,
+reference crops taken from the same photos): **45% within ±1 and no
+catastrophic miscounts** — the hardest photos (severe defocus/motion blur,
+pills with two differently-coloured faces) err by a bounded amount instead of
+the order-of-magnitude failures an earlier pipeline produced. The four bundled
+real photos are counted accurately (single-pill self-tests = 1, orange group
+exact, white group within tolerance).
 
 The `pytest` suite (27 tests) also covers the trickier cases directly:
 - **Per-colour/shape accuracy** — white/orange/red/yellow/blue/green pills on

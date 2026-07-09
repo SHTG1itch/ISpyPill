@@ -3,7 +3,8 @@ Unit tests for the pill-counting pipeline (new saturation/hue/value
 tray-ROI architecture).  Fast and deterministic — synthetic shapes only.
 Run:  pytest test_unit.py
 """
-import os, sys
+import os
+import zlib, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cv2
@@ -153,7 +154,10 @@ def test_count_pills_rejects_empty():
 ])
 def test_count_pills_accuracy_by_type(pill, tray, shape):
     n = 6
-    ref, grp, gt = make_case(hash((pill, tray, shape)) % 1000, pill, tray, shape, n)
+    # zlib.crc32, not hash(): Python string hashing is randomised per process,
+    # which made this test generate DIFFERENT images every run (flaky).
+    seed = zlib.crc32(f"{pill}|{tray}|{shape}".encode()) % 1000
+    ref, grp, gt = make_case(seed, pill, tray, shape, n)
     ref_area, ph, bh, achr, rs = analyze_reference(ref)
     count, _ = count_pills(grp, ref_area, ph, bh, is_achromatic=achr, ref_shape=rs)
     assert abs(count - gt) <= 1, f"{pill}/{tray}/{shape}: got {count}, expected {gt}"
@@ -212,9 +216,9 @@ def test_count_pills_recovers_border_cropped(pill, tray, shape):
     tray "hole-fill" model used to drop them entirely — a systematic undercount.
     They must now be recovered when the tray wraps them."""
     from tests.stress_probe import make_case_stress
-    ref, grp, gt = make_case_stress(7000 + hash((pill, tray, shape)) % 1000,
-                                    pill, tray, shape, n=8, touching=False,
-                                    border=True)
+    seed = 7000 + zlib.crc32(f"{pill}|{tray}|{shape}".encode()) % 1000
+    ref, grp, gt = make_case_stress(seed, pill, tray, shape, n=8,
+                                    touching=False, border=True)
     ref_area, ph, bh, achr, rs = analyze_reference(ref)
     count, _ = count_pills(grp, ref_area, ph, bh, is_achromatic=achr, ref_shape=rs)
     assert abs(count - gt) <= 1, f"{pill}/{tray}/{shape}: got {count}, expected {gt}"

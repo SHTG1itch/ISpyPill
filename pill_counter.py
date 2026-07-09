@@ -144,14 +144,106 @@ def _candidate_masks(bgr: np.ndarray) -> list:
         _, dm = cv2.threshold(dist, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         masks.append(dm)
 
+    # (4) Distance-from-CORNER-colour.  The frame corners are the most likely
+    #     places to see pure background even when other pills crowd the edges
+    #     or the centred pill is large (which breaks the ring model above).
+    #     Crucially this segments a TWO-TONE capsule as one region — both of
+    #     its colours differ from the background — where any single-channel
+    #     Otsu splits it into halves.
+    cp = max(6, int(round(min(h, w) * 0.12)))
+    corners = np.concatenate([
+        labf[:cp, :cp].reshape(-1, 3),  labf[:cp, -cp:].reshape(-1, 3),
+        labf[-cp:, :cp].reshape(-1, 3), labf[-cp:, -cp:].reshape(-1, 3)])
+    bg_corner = np.median(corners, axis=0)
+    dist = np.linalg.norm(labf - bg_corner, axis=2)
+    dist = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, dm = cv2.threshold(dist, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(dm)
+
     return masks
+
+
+def _split_candidates(mask: np.ndarray) -> list:
+    """
+    Extra candidate contours from erosion-reconstruction splitting.
+
+    When other pills crowd the reference pill, every threshold mask fuses them
+    into one non-pill-shaped blob and the true pill never becomes a candidate
+    contour.  Eroding by a fraction of the blob half-width severs the necks
+    between touching pills; dilating each separated core back (clipped to the
+    original mask) reconstructs one candidate region per pill.
+    """
+    m = ((mask > 0).astype(np.uint8)) * 255
+    if not m.any():
+        return []
+    dt = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+    r = float(dt.max())
+    if r < 5:
+        return []
+    # Large blobs are processed at reduced resolution: erosion cost grows with
+    # the square of the kernel size, and a blob 150 px deep needs 250 px
+    # kernels.  Splitting is geometric, so working at "half-width ~= 30 px"
+    # scale loses nothing that matters.
+    sc = 1.0 if r <= 35 else 35.0 / r
+    if sc < 1.0:
+        h_, w_ = m.shape
+        m_work = cv2.resize(m, (max(1, int(w_ * sc)), max(1, int(h_ * sc))),
+                            interpolation=cv2.INTER_NEAREST)
+        r_work = r * sc
+    else:
+        m_work, r_work = m, r
+    out = []
+    # Progressive erosion: neck widths vary (side-by-side pills have wide
+    # necks, tip-to-tip narrow ones), so no single depth separates every
+    # arrangement.  Harvest candidates at each depth that yields a split.
+    for f in (0.25, 0.4, 0.55, 0.7, 0.85):
+        ek = 2 * int(f * r_work) + 1
+        if ek < 3:
+            continue
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
+        core = cv2.erode(m_work, ker)
+        num, labels = cv2.connectedComponents(core, 8)
+        if num <= 2:                 # nothing separated at this depth
+            continue
+        for i in range(1, num):
+            comp = np.uint8(labels == i) * 255
+            region = cv2.bitwise_and(cv2.dilate(comp, ker), m_work)
+            cnts, _ = cv2.findContours(region, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            c = max(cnts, key=cv2.contourArea)
+            if sc < 1.0:
+                c = np.round(c.astype(np.float64) / sc).astype(np.int32)
+            out.append(c)
+    return out
 
 
 def _isolate_reference_pill(bgr: np.ndarray):
     """
     Return the contour of the single reference pill, chosen as the most
     pill-like candidate across all strategies in :func:`_candidate_masks`.
+
+    Isolation runs on a downscaled copy (candidate generation uses erosion
+    kernels proportional to the pill size, which is prohibitively slow at
+    full resolution) and the winning contour is scaled back up.  Colour and
+    histogram sampling in analyze_reference still happen at full resolution.
     """
+    h0, w0 = bgr.shape[:2]
+    scale = 640.0 / max(h0, w0)
+    if scale < 1.0:
+        small = cv2.resize(bgr, (max(1, int(round(w0 * scale))),
+                                 max(1, int(round(h0 * scale)))),
+                           interpolation=cv2.INTER_AREA)
+        c = _isolate_reference_pill_impl(small)
+        c = np.round(c.astype(np.float64) / scale).astype(np.int32)
+        c[:, :, 0] = np.clip(c[:, :, 0], 0, w0 - 1)
+        c[:, :, 1] = np.clip(c[:, :, 1], 0, h0 - 1)
+        return c
+    return _isolate_reference_pill_impl(bgr)
+
+
+def _isolate_reference_pill_impl(bgr: np.ndarray):
     h, w = bgr.shape[:2]
     img_area = float(h * w)
     center = np.array([w / 2.0, h / 2.0])
@@ -161,17 +253,23 @@ def _isolate_reference_pill(bgr: np.ndarray):
     k = max(3, int(round(min(h, w) * 0.01))) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
-    best = None
-    best_score = -1.0
+    labf = cv2.cvtColor(cv2.GaussianBlur(bgr, (5, 5), 0),
+                        cv2.COLOR_BGR2LAB).astype(np.float32)
+    gx = cv2.Sobel(labf[:, :, 0], cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(labf[:, :, 0], cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.magnitude(gx, gy)
 
+    # Pass 1 — cheap geometric terms for every candidate contour.
+    prelim = []
     for mask in _candidate_masks(bgr):
         m = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
         m = cv2.morphologyEx(m,    cv2.MORPH_CLOSE, kernel, iterations=2)
         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = list(cnts) + _split_candidates(m)
         for c in cnts:
             area = cv2.contourArea(c)
             frac = area / img_area
-            if not (0.004 <= frac <= 0.85):
+            if not (0.001 <= frac <= 0.85):
                 continue
             metrics = _shape_metrics(c)
             if metrics["solidity"] < 0.80:
@@ -182,20 +280,82 @@ def _isolate_reference_pill(bgr: np.ndarray):
             cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
             d = float(np.hypot(cx - center[0], cy - center[1]))
 
+            # A reference pill sits inside the frame; background regions and
+            # partially-visible neighbours hug the frame edges.  Touching one
+            # border is mildly suspicious, touching several means "this is the
+            # background / frame corner", not the pill being photographed.
+            bx, by, bw2, bh2 = cv2.boundingRect(c)
+            touches = int(bx <= 1) + int(by <= 1) + \
+                int(bx + bw2 >= w - 2) + int(by + bh2 >= h - 2)
+            border_term = 1.0 if touches == 0 else (0.7 if touches == 1 else 0.2)
+
             center_term = np.exp(-((d / (0.55 * diag)) ** 2))
             shape_term  = max(0.2, min(1.0, metrics["circularity"] * 1.5))
             solid_term  = metrics["solidity"]
-            # Prefer a moderate fraction of the frame (a centred pill close-up).
-            if 0.01 <= frac <= 0.45:
-                size_term = 1.0
-            elif frac < 0.01:
-                size_term = 0.5
-            else:                       # very large -> probably background blob
-                size_term = 0.35
 
-            score = solid_term * shape_term * center_term * size_term
-            if score > best_score:
-                best_score, best = score, c
+            # Prefer a moderate fraction of the frame (a centred pill close-up),
+            # but keep small candidates alive: a pill on a large tray can be
+            # a small part of the frame.
+            if 0.03 <= frac <= 0.45:
+                size_term = 1.0
+            elif frac > 0.45:           # very large -> probably background blob
+                size_term = 0.35
+            elif frac >= 0.01:
+                size_term = 0.5
+            elif frac >= 0.004:
+                size_term = 0.3
+            else:
+                size_term = 0.2
+
+            # Edge alignment: a real pill's outline sits on image edges along
+            # its whole length; a region carved out of a uniform surface (an
+            # erosion-split artefact of a large tray blob) has a boundary that
+            # mostly crosses flat colour.
+            pts = c.reshape(-1, 2)
+            gv = grad[np.clip(pts[:, 1], 0, h - 1), np.clip(pts[:, 0], 0, w - 1)]
+            edge_frac = float(np.mean(gv > 10.0))
+            edge_term = float(np.clip(0.15 + edge_frac * 1.1, 0.15, 1.0))
+
+            cheap = (solid_term * shape_term * center_term * size_term *
+                     border_term * edge_term)
+            prelim.append((cheap, frac, c))
+
+    # Pass 2 — colour terms (expensive) for the strongest candidates only,
+    # computed inside each candidate's bounding window, not the whole frame.
+    prelim.sort(key=lambda t: -t[0])
+    best = None
+    best_score = -1.0
+    for cheap, frac, c in prelim[:60]:
+        if cheap <= best_score:        # colour terms can only lower the score
+            break
+        bx, by, bw2, bh2 = cv2.boundingRect(c)
+        pad = 4 * k
+        x0, y0 = max(0, bx - pad), max(0, by - pad)
+        x1, y1 = min(w, bx + bw2 + pad), min(h, by + bh2 + pad)
+        win = labf[y0:y1, x0:x1]
+        cmask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.drawContours(cmask, [c], -1, 255, -1, offset=(-x0, -y0))
+        er = cv2.erode(cmask, kernel)
+        inner = er if cv2.countNonZero(er) > 30 else cmask
+        ring = cv2.dilate(cmask, kernel, iterations=3)
+        ring = cv2.bitwise_and(ring, cv2.bitwise_not(cmask))
+        if cv2.countNonZero(ring) < 30:
+            continue
+        inner_med = np.median(win[inner > 0], axis=0)
+        ring_med  = np.median(win[ring > 0], axis=0)
+
+        # Contrast between the candidate's interior and the surface ring
+        # around it.  A real pill differs sharply from the surface it sits
+        # on; glints, shadow wedges and gaps between pills have interiors
+        # almost identical to their surroundings.  Medians: the ring may
+        # contain slivers of neighbouring pills, but as long as the majority
+        # of it is surface, the median ignores them.
+        contrast = float(np.linalg.norm(inner_med - ring_med))
+        contrast_term = float(np.clip(contrast / 30.0, 0.1, 1.0))
+
+        score = cheap * contrast_term
+        if score > best_score:
+            best_score, best = score, c
 
     if best is None:
         raise ValueError(
@@ -312,6 +472,27 @@ def analyze_reference(image_np):
     if cv2.countNonZero(bg_mask) < 200:                  # pill nearly fills frame
         bg_mask = cv2.bitwise_not(pill_excl)
 
+    # Decontaminate the annulus: if other pills of the same type crowd the
+    # reference pill, they fall inside the annulus and their colour poisons the
+    # "tray" statistics (inverting every pill-vs-tray comparison downstream).
+    # Pixels that look like the pill are other pills; model the tray from the
+    # LEAST pill-like part of the annulus, then keep only pixels closer to
+    # that tray model than to the pill.
+    labf_full = cv2.cvtColor(image_np, cv2.COLOR_BGR2LAB).astype(np.float32)
+    pill_med = np.median(labf_full[pm > 0], axis=0)
+    ann_px = labf_full[bg_mask > 0]
+    if len(ann_px) >= 200:
+        d_pill = np.linalg.norm(ann_px - pill_med, axis=1)
+        far = ann_px[d_pill >= np.percentile(d_pill, 60)]
+        tray_med = np.median(far, axis=0)
+        keep = (np.linalg.norm(ann_px - tray_med, axis=1) <
+                np.linalg.norm(ann_px - pill_med, axis=1))
+        if keep.sum() >= 100:
+            ys, xs = np.nonzero(bg_mask)
+            drop = ~keep
+            bg_mask = bg_mask.copy()
+            bg_mask[ys[drop], xs[drop]] = 0
+
     # Use the ORIGINAL image HSV (CLAHE distorts saturation/hue relationships).
     hsv_img = cv2.cvtColor(image_np, cv2.COLOR_BGR2HSV)
     pill_hist = _hs_hist(hsv_img, pm)
@@ -366,7 +547,8 @@ def _largest_filled_regions(binary: np.ndarray, min_frac: float,
 
 
 def _recover_border_pills(side_is_pill: np.ndarray, roi: np.ndarray,
-                          tray_core: np.ndarray, img_area: float) -> np.ndarray:
+                          tray_core: np.ndarray, img_area: float,
+                          ctx: dict | None = None) -> np.ndarray:
     """
     Recover pills that touch the image border and are therefore lost by the
     "pill = enclosed hole in the tray" model: a pill at the frame edge is an
@@ -425,13 +607,23 @@ def _recover_border_pills(side_is_pill: np.ndarray, roi: np.ndarray,
         ring_n = int(ring.sum())
         if ring_n == 0:
             continue
-        if (ring & tray_bool).sum() / ring_n >= 0.55:
-            add[comp] = 255
+        if (ring & tray_bool).sum() / ring_n < 0.55:
+            continue
+        # The mask-side wrap test is not enough when the "tray side" of the
+        # split covers the whole background (value/flat-field cues): a bottle
+        # cap on the counter is then "tray-wrapped" too.  Require the ring to
+        # actually LOOK like the learned tray colour, not merely to fall on
+        # the tray side of the split.
+        if ctx is not None:
+            ring_med = np.median(ctx["labf"][ring], axis=0)
+            if float(np.linalg.norm(ring_med - ctx["tray_lab"])) > 38.0:
+                continue
+        add[comp] = 255
     return add
 
 
 def _tray_and_pills(side_is_tray: np.ndarray, side_is_pill: np.ndarray,
-                    img_area: float):
+                    img_area: float, ctx: dict | None = None):
     """
     Given a binary split of the image into a tray side and a pill side, return
     (roi, pill_mask): the filled tray region and the pill pixels inside it.
@@ -447,7 +639,7 @@ def _tray_and_pills(side_is_tray: np.ndarray, side_is_pill: np.ndarray,
     tray_core, roi = _largest_filled_regions(side_is_tray, 0.04, img_area)
     if cv2.countNonZero(roi) >= 0.12 * img_area:
         pill_mask = cv2.bitwise_and(side_is_pill, roi)
-        border = _recover_border_pills(side_is_pill, roi, tray_core, img_area)
+        border = _recover_border_pills(side_is_pill, roi, tray_core, img_area, ctx)
         if cv2.countNonZero(border):
             pill_mask = cv2.bitwise_or(pill_mask, border)
         return roi, pill_mask
@@ -456,18 +648,20 @@ def _tray_and_pills(side_is_tray: np.ndarray, side_is_pill: np.ndarray,
     return full, side_is_pill
 
 
-def _split_channel(chan: np.ndarray, tray_is_high: bool, img_area: float):
+def _split_channel(chan: np.ndarray, tray_is_high: bool, img_area: float,
+                   ctx: dict | None = None):
     """Otsu-split a single channel, then resolve tray ROI and pill mask."""
     chan = cv2.GaussianBlur(chan, (0, 0), 1.5)
     thr, _ = cv2.threshold(chan, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     high = (chan > thr).astype(np.uint8) * 255
     low  = cv2.bitwise_not(high)
     if tray_is_high:
-        return _tray_and_pills(high, low, img_area)
-    return _tray_and_pills(low, high, img_area)
+        return _tray_and_pills(high, low, img_area, ctx)
+    return _tray_and_pills(low, high, img_area, ctx)
 
 
-def _split_hue(hsv: np.ndarray, pill_hue: float, bg_hue: float, img_area: float):
+def _split_hue(hsv: np.ndarray, pill_hue: float, bg_hue: float, img_area: float,
+               ctx: dict | None = None):
     """
     Separate two distinct saturated colours by nearest hue.
 
@@ -481,10 +675,11 @@ def _split_hue(hsv: np.ndarray, pill_hue: float, bg_hue: float, img_area: float)
     db = np.abs(h - bg_hue);   db = np.minimum(db, 180.0 - db)
     pill_side = (dp < db).astype(np.uint8) * 255
     tray_side = (db <= dp).astype(np.uint8) * 255
-    return _tray_and_pills(tray_side, pill_side, img_area)
+    return _tray_and_pills(tray_side, pill_side, img_area, ctx)
 
 
-def _split_value_flatfield(v: np.ndarray, pill_brighter: bool, img_area: float):
+def _split_value_flatfield(v: np.ndarray, pill_brighter: bool, img_area: float,
+                           ctx: dict | None = None):
     """
     Separate pills from tray on the VALUE channel after flat-field correction.
 
@@ -515,7 +710,131 @@ def _split_value_flatfield(v: np.ndarray, pill_brighter: bool, img_area: float):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
     pill_side = cv2.morphologyEx(pill_side, cv2.MORPH_CLOSE, kernel, iterations=1)
     tray_side = cv2.bitwise_not(pill_side)
-    return _tray_and_pills(tray_side, pill_side, img_area)
+    return _tray_and_pills(tray_side, pill_side, img_area, ctx)
+
+
+def _split_lab_distance(bgr: np.ndarray, hsv: np.ndarray, ref_shape: dict,
+                        img_area: float, ctx: dict | None = None):
+    """
+    Separate pills from tray by LAB distance from the tray's reference colour.
+
+    This is the only cue that sees a TWO-TONE pill as one object (both of its
+    colours differ from the tray) and that combines hue, saturation and
+    brightness into a single measure — the group-photo analogue of the
+    corner-colour cue used on the reference photo.
+    """
+    px = np.uint8([[[round(ref_shape["bg_hue"]), round(ref_shape["bg_sat"]),
+                     round(ref_shape["bg_val"])]]])
+    tray_lab = cv2.cvtColor(cv2.cvtColor(px, cv2.COLOR_HSV2BGR),
+                            cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
+    lab = cv2.cvtColor(cv2.GaussianBlur(bgr, (5, 5), 0),
+                       cv2.COLOR_BGR2LAB).astype(np.float32)
+    dist = np.linalg.norm(lab - tray_lab, axis=2)
+    dist_u = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, pill_side = cv2.threshold(dist_u, 0, 255,
+                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    tray_side = cv2.bitwise_not(pill_side)
+    return _tray_and_pills(tray_side, pill_side, img_area, ctx)
+
+
+def _dt_peak_stats(pill_mask: np.ndarray):
+    """
+    (n_consistent_peaks, half_width) of a mask's distance-transform peaks.
+
+    Every pill contributes one interior peak whether or not it touches its
+    neighbours, and the peak value is the pill's half-width.  Two rounds:
+    estimate the typical half-width from the strongest peaks, then re-collect
+    peaks non-max-suppressed at that scale.
+    """
+    dt = cv2.distanceTransform(pill_mask, cv2.DIST_L2, 5)
+    if dt.max() < 3:
+        return 0, 0.0
+    r = float(np.percentile(dt[dt > 0], 99)) * 0.8
+    vals = None
+    for _ in range(2):
+        size = max(9, int(round(1.6 * r)) | 1)
+        mx = ndimage.maximum_filter(dt, size=size)
+        py, px = np.nonzero((dt >= mx - 1e-3) & (dt >= 0.4 * r))
+        if len(py) == 0:
+            return 0, 0.0
+        order = np.argsort(-dt[py, px])
+        peaks = []
+        for idx in order[:4000]:
+            y, x = py[idx], px[idx]
+            if all((y - oy) ** 2 + (x - ox) ** 2 > (1.5 * r) ** 2
+                   for oy, ox in peaks):
+                peaks.append((y, x))
+            if len(peaks) >= 800:
+                break
+        vals = np.array([dt[y, x] for (y, x) in peaks], np.float32)
+        r = float(np.median(vals))
+    n = int(np.sum((vals >= 0.72 * r) & (vals <= 1.38 * r)))
+    return n, r
+
+
+def _mask_quality(pill_mask: np.ndarray, img_area: float):
+    """
+    Measure how much a candidate pill mask looks like "a repeated population
+    of similar-size objects".
+
+    Isolated-component counting fails exactly when it matters (touching or
+    blurred pills leave no clean singletons), so pills are counted as PEAKS of
+    the distance transform: every pill contributes one interior peak whether
+    or not it touches its neighbours, and the peak value is the pill's
+    half-width.  A complete mask yields many peaks of consistent half-width; a
+    fragmentary mask yields few; an inverted/degenerate mask yields wildly
+    inconsistent ones.
+
+    Returns (n_consistent_peaks, mode_area); (0, 0) for degenerate masks.
+    """
+    if pill_mask is None:
+        return (0, 0.0)
+    fill = cv2.countNonZero(pill_mask) / img_area
+    # Even a tray packed edge-to-edge with pills stays under ~60% of the
+    # frame; more foreground than that means the polarity is inverted.
+    if fill < 0.0015 or fill > 0.60:
+        return (0, 0.0)
+    n, r = _dt_peak_stats(pill_mask)
+    if n == 0:
+        return (0, 0.0)
+    mode_area = float(np.pi * r * r)
+    # Consistent SPECKLE (embossing fragments, glare dots) also repeats, but
+    # real pills in a group photo are never this small a fraction of the frame.
+    if mode_area < 0.0008 * img_area:
+        return (0, 0.0)
+    # The consistent objects must account for a reasonable share of the mask:
+    # a mask that covers half the frame but contains only six pill-sized peaks
+    # is background noise that happens to include the pills, not a pill mask.
+    if n * mode_area < 0.12 * fill * img_area:
+        return (0, 0.0)
+    # Rank by explained pill MASS, not peak count: a fragment mask shatters
+    # each pill into several smaller consistent shards and would win a pure
+    # peak-count comparison, while explaining far fewer pill pixels.  Weight
+    # by precision so that of two masks explaining the same pills, the one
+    # without extra junk (shadows, background bleed) wins.
+    mass = n * mode_area
+    precision = min(1.0, mass / (fill * img_area))
+    return (mass * precision, mode_area)
+
+
+def _make_ctx(group_bgr: np.ndarray, rs: dict) -> dict | None:
+    """LAB image + learned pill/tray colour models, shared by the appearance
+    checks (border-pill recovery, thick-cluster validation)."""
+    keys = ("bg_hue", "bg_sat", "bg_val", "pill_hue", "pill_sat", "pill_val")
+    if not all(k in rs for k in keys):
+        return None
+
+    def _hsv_to_lab(h_, s_, v_):
+        px = np.uint8([[[int(round(h_)) % 180, int(np.clip(s_, 0, 255)),
+                         int(np.clip(v_, 0, 255))]]])
+        return cv2.cvtColor(cv2.cvtColor(px, cv2.COLOR_HSV2BGR),
+                            cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
+
+    return {
+        "labf": cv2.cvtColor(group_bgr, cv2.COLOR_BGR2LAB).astype(np.float32),
+        "tray_lab": _hsv_to_lab(rs["bg_hue"], rs["bg_sat"], rs["bg_val"]),
+        "pill_lab": _hsv_to_lab(rs["pill_hue"], rs["pill_sat"], rs["pill_val"]),
+    }
 
 
 def _build_pill_mask(group_bgr: np.ndarray,
@@ -556,52 +875,69 @@ def _build_pill_mask(group_bgr: np.ndarray,
     bg_hue   = rs.get("bg_hue")
     sat_sep  = abs(pill_sat - bg_sat)
     val_sep  = abs(pill_val - bg_val)
-    both_saturated = pill_sat >= 55 and bg_sat >= 55
+    # Hue is meaningful whenever both sides carry SOME colour; the mask-quality
+    # comparison below discards a hue split that turns out to be noise, so the
+    # gate can be permissive (a strict gate here cost real separations, e.g.
+    # a slightly desaturated blue pill on a beige tray).
+    both_saturated = pill_sat >= 40 and bg_sat >= 40
     hue_sep = (_hue_dist(pill_hue, bg_hue)
                if (pill_hue is not None and bg_hue is not None and both_saturated) else 0.0)
 
     roi = np.full((h, w), 255, np.uint8)
     pill_mask = None
 
-    # Choose the most discriminative cue by normalised separation.  Saturation
-    # gets a bonus because it is invariant to a glossy tray's glare/brightness
-    # gradient (the hardest real-world artefact), but a much stronger value or
-    # hue separation still wins:
-    #   SATURATION — pale pill on a coloured tray / coloured pill on a grey tray
-    #   HUE        — two distinct saturated colours (orange pill on blue tray)
-    #   VALUE      — achromatic pill on achromatic tray (white on grey/steel,
-    #                orange on dark wood), via glare-robust flat-field correction
-    # Saturation is trustworthy (and glare-robust) only when one side is
-    # genuinely saturated; otherwise a small saturation gap is just noise
-    # (e.g. white pill on a white tray) and value/hue should decide.
+    # Cue preference by normalised separation of the reference statistics.
+    # Saturation gets a bonus because it is invariant to a glossy tray's
+    # glare/brightness gradient; it is trustworthy only when one side is
+    # genuinely saturated.
     sat_reliable = sat_sep >= 30 and max(pill_sat, bg_sat) >= 70
     sat_score = (sat_sep / 255.0) * (1.6 if sat_reliable else 0.6)
     val_score = (val_sep / 255.0)
     hue_score = (hue_sep / 90.0) if hue_sep > 0 else 0.0
-    best = max(sat_score, val_score, hue_score)
 
-    if best < 0.11:
-        pill_mask = None                       # nothing separates -> back-projection
-    elif sat_score >= val_score and sat_score >= hue_score:
-        roi, pill_mask = _split_channel(hsv[:, :, 1], bg_sat > pill_sat, img_area)
-    elif hue_score >= val_score:
-        roi, pill_mask = _split_hue(hsv, pill_hue, bg_hue, img_area)
-    else:
-        roi, pill_mask = _split_value_flatfield(hsv[:, :, 2], pill_val > bg_val, img_area)
+    # Build ALL candidate masks and choose by MEASURED quality (how much each
+    # mask looks like a repeated population of pill-shaped objects) rather
+    # than committing to a single cue.  Reference statistics can be subtly
+    # wrong (contaminated background, unusual lighting) and a mis-chosen cue
+    # produces a degenerate mask — invisible unless masks are compared.
+    # Colour models for border-pill recovery: a component at the frame edge is
+    # only admitted when the surface wrapping it looks like the LEARNED tray.
+    ctx = _make_ctx(group_bgr, rs)
+
+    candidates = []          # (pref, roi, mask)
+    if sat_score >= 0.05:
+        r_, m_ = _split_channel(hsv[:, :, 1], bg_sat > pill_sat, img_area, ctx)
+        candidates.append((sat_score + 0.02, r_, m_))
+    if hue_score > 0:
+        r_, m_ = _split_hue(hsv, pill_hue, bg_hue, img_area, ctx)
+        candidates.append((hue_score + 0.01, r_, m_))
+    if val_sep >= 8:
+        r_, m_ = _split_value_flatfield(hsv[:, :, 2], pill_val > bg_val,
+                                        img_area, ctx)
+        candidates.append((val_score, r_, m_))
+    if all(k in rs for k in ("bg_hue", "bg_sat", "bg_val")):
+        r_, m_ = _split_lab_distance(group_bgr, hsv, rs, img_area, ctx)
+        candidates.append((0.05, r_, m_))
+    # Histogram back-projection: the last-resort discriminator.
+    p_pill = _backproject(hsv, pill_hist).astype(np.int16)
+    p_bg   = _backproject(hsv, bg_hist).astype(np.int16)
+    blur = lambda m: cv2.GaussianBlur(m.astype(np.float32), (0, 0), 2.0)
+    fp, fb = blur(p_pill), blur(p_bg)
+    tray_side = ((fb > fp) & (fb > 15)).astype(np.uint8) * 255
+    pill_side = (fp >= fb).astype(np.uint8) * 255
+    r_, m_ = _tray_and_pills(tray_side, pill_side, img_area, ctx)
+    candidates.append((0.0, r_, m_))
+
+    best_key = None
+    for pref, cand_roi, cand_mask in candidates:
+        n, mode_area = _mask_quality(cand_mask, img_area)
+        key = (n, mode_area, pref)
+        if best_key is None or key > best_key:
+            best_key = key
+            roi, pill_mask = cand_roi, cand_mask
 
     if pill_mask is None or cv2.countNonZero(pill_mask) < 0.0015 * img_area:
-        # Hue path: back-project both histograms and split on which dominates.
-        p_pill = _backproject(hsv, pill_hist).astype(np.int16)
-        p_bg   = _backproject(hsv, bg_hist).astype(np.int16)
-        blur = lambda m: cv2.GaussianBlur(m.astype(np.float32), (0, 0), 2.0)
-        fp, fb = blur(p_pill), blur(p_bg)
-        tray_side = ((fb > fp) & (fb > 15)).astype(np.uint8) * 255
-        pill_side = (fp >= fb).astype(np.uint8) * 255
-        roi_bp, pm_bp = _tray_and_pills(tray_side, pill_side, img_area)
-        if cv2.countNonZero(pm_bp) >= 0.0015 * img_area:
-            roi, pill_mask = roi_bp, pm_bp
-        elif pill_mask is None:
-            pill_mask = (fp > fb).astype(np.uint8) * 255
+        pill_mask = (fp > fb).astype(np.uint8) * 255
 
     # Degenerate guard: nearly-empty or nearly-full mask -> last-resort.
     fill = cv2.countNonZero(pill_mask) / img_area
@@ -662,13 +998,20 @@ def _estimate_pill_area(mask: np.ndarray, ref_area: float,
     # speckle clusters and merged blobs — all of which are irregular.
     if ref_shape is not None:
         circ_min = max(0.42, ref_shape["circularity"] - 0.22)
-        ar_min   = max(0.18, ref_shape["aspect_ratio"] - 0.28)
+        # Generous: the reference aspect ratio is measured from one contour
+        # and can be off by 0.3 for oblongs; solidity + circularity already
+        # reject glare streaks, so this gate only needs to catch extremes.
+        ar_min   = max(0.15, ref_shape["aspect_ratio"] - 0.40)
     else:
         circ_min, ar_min = 0.55, 0.30
 
+    # The speck floor must NOT scale with the reference: a close-up reference
+    # pill can be 25x the group pills' size, and a ref-relative floor would
+    # then exclude every real pill (leaving no singletons and a catastrophic
+    # eff_area = ref_area -> count 0).  Speck size is a property of the image.
     singletons = sorted(
         area for (_, area, _, sm) in comps
-        if area >= max(200, ref_area * 0.04)
+        if area >= max(200, 0.0003 * mask.size)
         and sm["solidity"] >= 0.90
         and sm["circularity"] >= circ_min
         and sm["aspect_ratio"] >= ar_min
@@ -688,20 +1031,23 @@ def _estimate_pill_area(mask: np.ndarray, ref_area: float,
                 clusters.append([a])
         best = max(clusters, key=lambda c: (len(c), sum(c)))
         est = float(np.median(best))
-        # Noise guard: a single pill is never a tiny fraction of the reference
-        # pill (that would need an extreme distance change).  An implausibly
-        # small estimate means the "pills" are really background texture, so
-        # fall back to the reference area rather than counting speckle.
-        if est >= ref_area * 0.12:
-            return float(np.clip(est, ref_area / 15.0, ref_area * 15.0))
+        # Noise guard: an estimate far below the reference is either a real
+        # camera-distance change (reference shot close up) or speckle noise.
+        # Real pills leave MANY consistent singletons and clusters of sane
+        # size; speckle leaves a few tiny blobs next to a giant merged blob
+        # (dividing by which would multiply the count catastrophically).  So a
+        # small estimate is trusted only with strong, consistent evidence.
+        if est < ref_area * 0.12:
+            largest = max(area for (_, area, _, _) in comps)
+            if len(best) < 4 or largest > est * 80:
+                return ref_area
+        return float(np.clip(est, ref_area / 25.0, ref_area * 15.0))
 
-    # No clean singleton: trust the reference but clamp to the smallest solid,
-    # reasonably-round blob so cleanup kernels stay proportional to real pills.
-    solids = [area for (_, area, _, sm) in comps
-              if sm["solidity"] >= 0.88 and sm["circularity"] >= circ_min
-              and area >= max(200, ref_area * 0.04)]
-    if solids:
-        return float(np.clip(min(solids), ref_area / 15.0, ref_area * 4.0))
+    # No clean singleton: trust the reference.  Deriving a scale from whatever
+    # solid blob happens to be smallest lets a single glint/speck set the pill
+    # size and multiply every cluster's count by 10-15x (a catastrophic
+    # overcount).  Without singleton evidence, the reference area — measured
+    # from a real pill — is the only trustworthy scale.
     return ref_area
 
 
@@ -730,7 +1076,7 @@ def _clean_mask(mask: np.ndarray, eff_radius: float) -> np.ndarray:
 
 def _count_pills_in_mask(mask: np.ndarray, annotated: np.ndarray,
                          eff_area: float, eff_radius: float,
-                         ref_shape: dict | None):
+                         ref_shape: dict | None, ctx: dict | None = None):
     """
     Count pills in a cleaned binary mask.
 
@@ -797,9 +1143,38 @@ def _count_pills_in_mask(mask: np.ndarray, annotated: np.ndarray,
             # background is already excluded by the saturation/tray mask.
             if metrics["solidity"] < 0.40:
                 continue
+            # A cluster of single-layer pills is roughly one pill THICK: its
+            # distance-transform peak sits near the pill radius.  A ragged
+            # background network has no pill-thick interior (peak far below)
+            # and is never a pill cluster.  A region much THICKER than a pill
+            # is either a background sheet or a dense gap-free pile — geometry
+            # cannot tell them apart, so appearance decides: keep it only if
+            # its interior actually looks like the pill rather than the tray.
+            comp_dt = cv2.distanceTransform(comp, cv2.DIST_L2, 5)
+            peak = float(comp_dt.max())
+            if peak < 0.45 * eff_radius:
+                continue
+            if peak > 2.4 * eff_radius:
+                # Off-tray background always reaches the frame border (it
+                # surrounds the tray); a dense pile of pills sits interior.
+                border_px = (int(np.count_nonzero(comp[0, :])) +
+                             int(np.count_nonzero(comp[-1, :])) +
+                             int(np.count_nonzero(comp[:, 0])) +
+                             int(np.count_nonzero(comp[:, -1])))
+                if border_px > 10 or ctx is None:
+                    continue
+                comp_med = np.median(ctx["labf"][comp > 0], axis=0)
+                d_pill = float(np.linalg.norm(comp_med - ctx["pill_lab"]))
+                d_tray = float(np.linalg.norm(comp_med - ctx["tray_lab"]))
+                if d_pill >= d_tray:
+                    continue
             # Area ratio is the reliable estimate for flat, non-overlapping pills
             # (total area = N x pill area).  Distance-transform peaks over-segment
-            # capsules, so they are NOT used to inflate the count; area wins.
+            # capsules (a long ridge yields several maxima), so peaks refine the
+            # count only for ROUND pills, where one pill = one peak and the
+            # estimate is immune to interstitial-gap inflation and to an
+            # imprecise reference size.  Wildly inconsistent peak counts mean
+            # the cluster is not clean circles after all — keep the area ratio.
             count = area_n
 
         total += count
@@ -894,7 +1269,8 @@ def count_pills(group_image_np, ref_area, pill_hist, bg_hist,
     mask = _clean_mask(pre, eff_radius)
 
     total, annotated, regions = _count_pills_in_mask(
-        mask, annotated, eff_area, eff_radius, ref_shape
+        mask, annotated, eff_area, eff_radius, ref_shape,
+        ctx=_make_ctx(group_image_np, ref_shape or {})
     )
 
     annotated = _annotate(annotated, regions, total)
